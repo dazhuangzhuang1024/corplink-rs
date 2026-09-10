@@ -89,7 +89,10 @@ jobs:
           cd target
           cp release/corplink-rs .
           cp ../config/config.json .
-          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
+          mkdir -p launchd scripts
+          cp ../launchd/com.github.pinkd.corplink-rs.plist launchd/
+          cp ../scripts/install-launchd.sh ../scripts/uninstall-launchd.sh scripts/
+          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json launchd scripts
       - name: upload package to artifact
         uses: actions/upload-artifact@v6
         with:

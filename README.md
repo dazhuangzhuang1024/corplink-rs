@@ -122,6 +122,75 @@ $env:RUST_LOG="debug"; .\corplink-rs.exe config.json
 macos 要求 tun 设备的名称满足正则表达式 `utun[0-9]*` ，因此需要将配置文件中的 `interface_name` 改为符合正则的名字，例如 `utun12345`  
 另外， `utun` 后的数字类型应该是 `int16` ，如果大于 `32767` 会报错 `Failed to create TUN device: invalid argument` 。具体参考 [#46](https://github.com/PinkD/corplink-rs/issues/46)
 
+### macOS 后台服务（launchd）
+
+首次安装时需要注意，LaunchDaemon 没有交互终端。如果 `config.json` 中的认证信息可以自动完成登录，可以直接安装；如果首次登录需要扫码或输入验证码，应先在前台完成登录，看到 VPN 已连接后按 `Ctrl+C` 退出：
+
+```bash
+./libwg/build.sh
+cargo build --release
+
+# 仅在首次登录需要交互时执行
+sudo ./target/release/corplink-rs "$PWD/config.json"
+```
+
+然后安装并立即启动后台服务：
+
+```bash
+sudo ./scripts/install-launchd.sh \
+  --binary "$PWD/target/release/corplink-rs" \
+  --config "$PWD/config.json" \
+  --vpn-server Node03 \
+  --log-filter corplink_rs=debug
+```
+
+安装脚本会完成以下操作：
+
+1. 将 `target/release/corplink-rs` 复制到 `/usr/local/bin/corplink-rs`。
+2. 根据配置文件的绝对路径生成 `/Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist`。
+3. 执行 `launchctl bootstrap` 并启动一个 corplink-rs 实例。
+4. 核对进程属于该 LaunchDaemon；失败时恢复安装前的二进制和服务。
+
+plist 设置了 `RunAtLoad`，因此以后开机时会自动启动。已经安装但当前未加载时，使用下面的命令启动：
+
+```bash
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist
+```
+
+脚本不会复制或修改 `config.json`，只把它的绝对路径传给程序。工作目录会设为配置文件所在目录，以保证 cookie 的读取和保存位置一致，因此安装后不要移动配置文件。
+
+服务以 root 身份读取配置和保存 cookie，应限制这些文件的读取权限，并且只允许可信管理员修改配置目录。程序会拒绝通过符号链接回写配置或 cookie。
+
+更新源码后，使用相同流程重编并重装。安装脚本会优雅停止旧服务、替换 `/usr/local/bin/corplink-rs` 和 plist，再启动一个新实例；失败时会恢复旧二进制和服务：
+
+```bash
+./libwg/build.sh
+cargo build --release
+sudo ./scripts/install-launchd.sh \
+  --vpn-server Node03 \
+  --log-filter corplink_rs=debug
+```
+
+状态、日志、重启和卸载：
+
+```bash
+# status
+sudo launchctl print system/com.github.pinkd.corplink-rs
+pgrep -fl corplink-rs
+
+# logs
+sudo tail -f /var/log/corplink-rs.err.log /var/log/corplink-rs.log
+
+# restart
+sudo launchctl bootout system/com.github.pinkd.corplink-rs
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist
+
+# stop and uninstall (config, cookies, and logs are preserved)
+sudo ./scripts/uninstall-launchd.sh
+```
+
+LaunchDaemon 本身以 root 身份运行，plist 的 `ProgramArguments` 中不应再加入 `sudo`。服务会在开机时启动，并在进程异常退出（包括握手超时）后重新拉起；如果进程频繁退出，启动频率会被限制为最多每 60 秒一次。
+
 ## log level 配置
 
 本项目使用 [env_logger](https://docs.rs/env_logger/latest/env_logger/) 作为 log 库，修改 log level 需要使用环境变量，示例：

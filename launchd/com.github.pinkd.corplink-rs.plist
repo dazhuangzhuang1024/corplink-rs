@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.pinkd.corplink-rs</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/corplink-rs</string>
+        <string>/path/to/config.json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+        <key>RUST_LOG</key>
+        <string>corplink_rs=info</string>
+        <key>CORPLINK_VPN_SERVER_NAME</key>
+        <string></string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/corplink-rs.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/corplink-rs.err.log</string>
+</dict>
+</plist>
