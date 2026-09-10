@@ -1,5 +1,6 @@
 use std::fmt;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -174,10 +175,60 @@ impl Config {
             .as_ref()
             .context("config file path missing")?;
         let data = format!("{}", &self);
-        fs::write(file, data)
+
+        let mut options = fs::OpenOptions::new();
+        options.write(true).truncate(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+
+        let mut output = options
+            .open(file)
+            .await
+            .with_context(|| format!("failed to open config file {file} for writing"))?;
+        output
+            .write_all(data.as_bytes())
             .await
             .with_context(|| format!("failed to write config file {file}"))?;
+        output
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush config file {file}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::Config;
+
+    fn minimal_config() -> Config {
+        serde_json::from_str(r#"{"company_name":"test","username":"test"}"#).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_save_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!("corplink-config-target-{unique}"));
+        let link = std::env::temp_dir().join(format!("corplink-config-link-{unique}"));
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let mut config = minimal_config();
+        config.conf_file = Some(link.to_string_lossy().into_owned());
+
+        assert!(config.save().await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&target).unwrap();
     }
 }
 

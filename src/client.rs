@@ -32,6 +32,32 @@ use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 
+fn cookie_file_path(conf: &Config) -> Result<path::PathBuf> {
+    let config_file = conf
+        .conf_file
+        .as_ref()
+        .context("config file path missing")?;
+    let interface_name = conf
+        .interface_name
+        .as_ref()
+        .context("interface name missing in config")?;
+    let directory = path::Path::new(config_file)
+        .parent()
+        .unwrap_or_else(|| path::Path::new("."));
+    Ok(directory.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX)))
+}
+
+fn open_cookie_file_for_write(cookie_file: &path::Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(cookie_file)
+}
+
 fn merge_additional_routes(
     mut routes: Vec<String>,
     additional_routes: &[String],
@@ -179,16 +205,7 @@ pub async fn get_company_url(code: &str) -> anyhow::Result<RespCompany> {
 
 impl Client {
     pub fn new(conf: Config) -> Result<Client> {
-        let f = conf.conf_file.clone().context("config file path missing")?;
-        let interface_name = conf
-            .interface_name
-            .clone()
-            .context("interface name missing in config")?;
-        let dir = match path::Path::new(&f).parent() {
-            Some(dir) => dir,
-            None => path::Path::new("."),
-        };
-        let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
+        let cookie_file = cookie_file_path(&conf)?;
         log::info!("cookie file is: {}", cookie_file.to_string_lossy());
 
         let mut cookie_store = {
@@ -264,18 +281,15 @@ impl Client {
     }
 
     fn save_cookie(&self) -> Result<()> {
-        let interface_name = self
-            .conf
-            .interface_name
-            .as_ref()
-            .context("interface name missing in config")?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(false)
-            .open(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX))
+        let cookie_file = cookie_file_path(&self.conf)?;
+        let mut file = open_cookie_file_for_write(&cookie_file)
             .map(io::BufWriter::new)
-            .with_context(|| "failed to open cookie file for writing")?;
+            .with_context(|| {
+                format!(
+                    "failed to open cookie file {} for writing",
+                    cookie_file.display()
+                )
+            })?;
         let c = self
             .cookie
             .lock()
@@ -1424,7 +1438,10 @@ mod tests {
     use tokio::sync::{oneshot, Barrier};
     use tokio::time::{sleep, timeout};
 
-    use super::{merge_additional_routes, resolve_additional_domains, Client, ReqwestCookieStore};
+    use super::{
+        merge_additional_routes, open_cookie_file_for_write, resolve_additional_domains, Client,
+        ReqwestCookieStore,
+    };
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
     use crate::utils::apply_route_filters;
@@ -1479,6 +1496,27 @@ mod tests {
             id: 0,
             timeout: 0,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cookie_writer_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!("corplink-cookie-target-{unique}"));
+        let link = std::env::temp_dir().join(format!("corplink-cookie-link-{unique}"));
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(open_cookie_file_for_write(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&target).unwrap();
     }
 
     fn test_client() -> Client {
