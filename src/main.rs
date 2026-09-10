@@ -133,7 +133,9 @@ async fn run() -> Result<()> {
         }
     }
 
-    let with_wg_log = conf.debug_wg.unwrap_or_default();
+    // A crate-level debug filter should also expose wireguard-go's handshake
+    // and transport logs, without requiring a config-file change.
+    let with_wg_log = conf.debug_wg.unwrap_or_default() || log::log_enabled!(log::Level::Debug);
     let platform = conf.platform.clone();
     let mut c = Client::new(conf).context("failed to initialize client")?;
     let mut logout_retry = true;
@@ -206,11 +208,6 @@ async fn run() -> Result<()> {
     let mut exit_code = 0;
     tokio::select! {
         _ = wait_for_shutdown_signal() => {},
-
-        // keep alive
-        // _ = c.keep_alive_vpn(&wg_conf, 60) => {
-        //     exit_code = ETIMEDOUT;
-        // },
 
         // check wg handshake and exit if timeout
         _ = async {
