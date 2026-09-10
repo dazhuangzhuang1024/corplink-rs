@@ -58,6 +58,10 @@ fn open_cookie_file_for_write(cookie_file: &path::Path) -> io::Result<fs::File> 
     options.open(cookie_file)
 }
 
+fn matches_vpn_server_name(vpn: &RespVpnInfo, expected: Option<&str>) -> bool {
+    expected.map_or(true, |name| vpn.name == name || vpn.en_name == name)
+}
+
 fn merge_additional_routes(
     mut routes: Vec<String>,
     additional_routes: &[String],
@@ -1073,11 +1077,15 @@ impl Client {
         let filtered_vpn = vpn_info
             .into_iter()
             .filter(|vpn| {
-                if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
-                        return false;
-                    }
+                let server_name = self.conf.effective_vpn_server_name();
+                if !matches_vpn_server_name(vpn, server_name) {
+                    log::info!(
+                        "skip {}/{}, expect {}",
+                        vpn.name,
+                        vpn.en_name,
+                        server_name.unwrap_or_default()
+                    );
+                    return false;
                 }
                 true
             })
@@ -1439,8 +1447,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        merge_additional_routes, open_cookie_file_for_write, resolve_additional_domains, Client,
-        ReqwestCookieStore,
+        matches_vpn_server_name, merge_additional_routes, open_cookie_file_for_write,
+        resolve_additional_domains, Client, ReqwestCookieStore,
     };
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
@@ -1496,6 +1504,17 @@ mod tests {
             id: 0,
             timeout: 0,
         }
+    }
+
+    #[test]
+    fn vpn_server_name_matches_localized_or_english_name() {
+        let mut vpn = vpn_info(443, "node-en");
+        vpn.name = "node-local".to_string();
+
+        assert!(matches_vpn_server_name(&vpn, None));
+        assert!(matches_vpn_server_name(&vpn, Some("node-local")));
+        assert!(matches_vpn_server_name(&vpn, Some("node-en")));
+        assert!(!matches_vpn_server_name(&vpn, Some("another-node")));
     }
 
     #[cfg(unix)]

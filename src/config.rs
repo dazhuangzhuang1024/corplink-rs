@@ -68,6 +68,13 @@ pub struct Config {
     pub conf_file: Option<String>,
     pub state: Option<State>,
     pub vpn_server_name: Option<String>,
+    /// Runtime-only override for `vpn_server_name`, currently fed by the
+    /// CORPLINK_VPN_SERVER_NAME environment variable so a launchd job can pin a
+    /// node without editing the config file. Skipped by serde in both directions:
+    /// it cannot be set from the config file, and `save` can never write it back.
+    /// Read it through [`Config::effective_vpn_server_name`], never directly.
+    #[serde(skip)]
+    pub vpn_server_name_override: Option<String>,
     pub vpn_select_strategy: Option<String>,
     pub use_vpn_dns: Option<bool>,
     pub dns_backup_filename: Option<String>,
@@ -169,6 +176,14 @@ impl Config {
         Ok(conf)
     }
 
+    /// VPN server name to filter on: the runtime override wins over the value
+    /// persisted in the config file.
+    pub fn effective_vpn_server_name(&self) -> Option<&str> {
+        self.vpn_server_name_override
+            .as_deref()
+            .or(self.vpn_server_name.as_deref())
+    }
+
     pub async fn save(&self) -> Result<()> {
         let file = self
             .conf_file
@@ -205,6 +220,46 @@ mod tests {
 
     fn minimal_config() -> Config {
         serde_json::from_str(r#"{"company_name":"test","username":"test"}"#).unwrap()
+    }
+
+    #[test]
+    fn runtime_override_wins_over_the_configured_server_name() {
+        let mut config = minimal_config();
+        assert_eq!(config.effective_vpn_server_name(), None);
+
+        config.vpn_server_name = Some("from-file".to_string());
+        assert_eq!(config.effective_vpn_server_name(), Some("from-file"));
+
+        config.vpn_server_name_override = Some("from-env".to_string());
+        assert_eq!(config.effective_vpn_server_name(), Some("from-env"));
+
+        config.vpn_server_name = None;
+        assert_eq!(config.effective_vpn_server_name(), Some("from-env"));
+    }
+
+    #[test]
+    fn runtime_override_is_never_serialized_and_never_read_from_file() {
+        let mut config = minimal_config();
+        config.vpn_server_name = Some("from-file".to_string());
+        config.vpn_server_name_override = Some("from-env".to_string());
+
+        // `save` serializes via Display, so this is exactly what hits the file.
+        let serialized = format!("{config}");
+        assert!(!serialized.contains("vpn_server_name_override"));
+        assert!(!serialized.contains("from-env"));
+        assert!(serialized.contains("from-file"));
+
+        // Reloading the written config must not resurrect the override.
+        let reloaded: Config = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.vpn_server_name_override, None);
+        assert_eq!(reloaded.effective_vpn_server_name(), Some("from-file"));
+
+        // The field is also not settable from a hand-written config file.
+        let injected: Config = serde_json::from_str(
+            r#"{"company_name":"test","username":"test","vpn_server_name_override":"sneaky"}"#,
+        )
+        .unwrap();
+        assert_eq!(injected.vpn_server_name_override, None);
     }
 
     #[cfg(unix)]

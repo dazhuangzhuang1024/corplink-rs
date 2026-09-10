@@ -119,6 +119,20 @@ async fn run() -> Result<()> {
             .context("failed to persist company server")?;
     }
 
+    // Runtime-only override. It goes to a `#[serde(skip)]` field rather than to
+    // `vpn_server_name`, because later `Config::save` calls (login state changes)
+    // serialize the whole config and would otherwise persist this environment
+    // setting into the user's config file.
+    if let Ok(vpn_server_name) = env::var("CORPLINK_VPN_SERVER_NAME") {
+        if !vpn_server_name.is_empty() {
+            log::info!(
+                "selecting VPN server {:?} from environment",
+                vpn_server_name
+            );
+            conf.vpn_server_name_override = Some(vpn_server_name);
+        }
+    }
+
     let with_wg_log = conf.debug_wg.unwrap_or_default();
     let platform = conf.platform.clone();
     let mut c = Client::new(conf).context("failed to initialize client")?;
