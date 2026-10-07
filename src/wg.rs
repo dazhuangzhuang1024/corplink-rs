@@ -212,6 +212,9 @@ impl UAPIClient {
         // default refresh key timeout of wg is 2 min
         // we set wg connection timeout to 5 min
         let interval = time::Duration::from_secs(5 * 60);
+        // with a 10s persistent keepalive the first handshake comes within
+        // seconds; a tunnel still without one after `interval` never got up
+        let started = time::Instant::now();
         let mut ticker = tokio::time::interval(interval);
         let mut timeout = false;
         // consume the first tick
@@ -246,7 +249,13 @@ impl UAPIClient {
                     match last.parse::<i64>() {
                         Ok(timestamp) => {
                             if timestamp == 0 {
-                                // do nothing because it's invalid
+                                if started.elapsed() >= interval {
+                                    log::warn!(
+                                        "no handshake with the server within {}s of starting",
+                                        interval.as_secs()
+                                    );
+                                    timeout = true;
+                                }
                             } else if let Some(nt) = chrono::DateTime::from_timestamp(timestamp, 0)
                             {
                                 let now = chrono::Utc::now().to_utc();

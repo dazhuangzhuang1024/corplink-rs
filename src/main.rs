@@ -97,6 +97,32 @@ async fn run() -> Result<()> {
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let dns_backup_filename = conf.dns_backup_filename.clone();
+    // macOS per-domain split DNS (/etc/resolver), independent of use_vpn_dns:
+    // the system-wide DNS settings stay untouched either way.
+    #[cfg(target_os = "macos")]
+    let split_dns_domains = conf.split_dns_domains.clone().unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let mut resolver_files = dns::ResolverFiles::new(dns::RESOLVER_DIR, &name);
+    // clean up after earlier runs that never got to remove their files
+    // (SIGKILL, crash, power loss), even if split dns has been switched off since
+    #[cfg(target_os = "macos")]
+    if !netstack_mode {
+        if let Err(err) = resolver_files.remove_stale(dns::interface_exists) {
+            log::warn!("{:#}", err);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if netstack_mode && !split_dns_domains.is_empty() {
+        log::warn!("split_dns_domains is ignored in socks5/netstack mode");
+    }
+    #[cfg(not(target_os = "macos"))]
+    if conf
+        .split_dns_domains
+        .as_ref()
+        .is_some_and(|d| !d.is_empty())
+    {
+        log::warn!("split_dns_domains is only supported on macOS, ignoring it");
+    }
 
     if conf.server.is_none() {
         let resp = client::get_company_url(conf.company_name.as_str())
@@ -205,6 +231,37 @@ async fn run() -> Result<()> {
         }
     }
 
+    // the DNS assigned by the VPN can change between sessions, so the
+    // /etc/resolver files must be rewritten with this session's value on
+    // every connect; they are removed again on shutdown below
+    #[cfg(target_os = "macos")]
+    if !netstack_mode && !split_dns_domains.is_empty() {
+        // the listed domains only resolve while their DNS server is reached
+        // through the tunnel
+        for server in dns::split_dns_servers(&wg_conf.dns) {
+            if let Ok(ip) = server.parse() {
+                if !utils::cidrs_contain_ip(&wg_conf.allowed_ips, ip) {
+                    log::warn!(
+                        "split dns: DNS server {} is outside the tunnel's allowed IPs, \
+                         lookups for split_dns_domains will not go through the VPN",
+                        server
+                    );
+                }
+            }
+        }
+        // the marker names the interface, and the next start's stale check
+        // relies on that being the real device name
+        if !dns::interface_exists(&name) {
+            log::warn!(
+                "split dns: no interface named {:?} after starting the tunnel, \
+                 use interface_name of the form utunN; no resolver files written",
+                name
+            );
+        } else if let Err(err) = resolver_files.write(&wg_conf.dns, &split_dns_domains) {
+            log::warn!("{:#}", err);
+        }
+    }
+
     let mut exit_code = 0;
     tokio::select! {
         _ = wait_for_shutdown_signal() => {},
@@ -219,6 +276,13 @@ async fn run() -> Result<()> {
     }
 
     // shutdown
+    // split dns goes first: it is useless without the tunnel, and the network
+    // calls below can take a while to time out once the link is gone
+    #[cfg(target_os = "macos")]
+    if let Err(err) = resolver_files.remove() {
+        log::warn!("{:#}", err);
+    }
+
     log::info!("disconnecting vpn...");
     if let Err(e) = c.disconnect_vpn(&wg_conf).await {
         log::warn!("failed to disconnect vpn: {}", e)

@@ -13,12 +13,54 @@ use sha1::{Digest, Sha1};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub async fn read_line() -> Result<String> {
+    ensure_interactive(
+        "this login step",
+        "stop the service, run corplink-rs once in a terminal to log in, then start the \
+         service again",
+    )?;
     io::stdin()
         .lock()
         .lines()
         .next()
         .context("stdin closed")?
         .context("failed to read line")
+}
+
+/// Fails when stdin is /dev/null or closed, as under launchd: a prompt could
+/// never be answered, and requesting e.g. an email code first would send a
+/// new one on every restart of the service.
+pub fn ensure_interactive(what: &str, hint: &str) -> Result<()> {
+    if stdin_is_usable() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{what} needs input, but stdin is not usable (e.g. running under launchd): {hint}"
+    ))
+}
+
+fn stdin_is_usable() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        match io::stdin().as_fd().try_clone_to_owned() {
+            Ok(stdin) => !is_dev_null(&std::fs::File::from(stdin)),
+            // closed
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+#[cfg(unix)]
+fn is_dev_null(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    match (file.metadata(), std::fs::metadata("/dev/null")) {
+        (Ok(file), Ok(null)) => file.file_type().is_char_device() && file.rdev() == null.rdev(),
+        _ => false,
+    }
 }
 
 pub fn b32_decode(s: &str) -> Result<Vec<u8>> {
@@ -80,6 +122,16 @@ pub fn feilian_v1_encrypt_password(password: &str) -> String {
 /// Returns whether `cidr` is a parseable IPv4 or IPv6 CIDR.
 pub fn is_valid_cidr(cidr: &str) -> bool {
     parse_cidr(cidr).is_some()
+}
+
+/// Returns whether `ip` lies inside any of `cidrs`. Entries without a prefix
+/// length are single hosts, as in the wg allowed_ips list.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn cidrs_contain_ip(cidrs: &[String], ip: IpAddr) -> bool {
+    cidrs.iter().any(|cidr| match parse_cidr(cidr) {
+        Some((base, prefix)) => cidr_contains_ip(base, prefix, ip),
+        None => cidr.parse::<IpAddr>() == Ok(ip),
+    })
 }
 
 /// Returns the intersection of two CIDRs, or `None` when they are disjoint,
@@ -310,6 +362,41 @@ mod tests {
             intersect_cidr_with_cidr("10.1.0.0/16", "10.0.0.0/8"),
             Some("10.1.0.0/16".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_null_is_recognized() {
+        assert!(is_dev_null(&std::fs::File::open("/dev/null").unwrap()));
+        assert!(is_dev_null(
+            &std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap()
+        ));
+        assert!(!is_dev_null(&std::fs::File::open("/dev/zero").unwrap()));
+        assert!(!is_dev_null(
+            &std::fs::File::open(std::env::current_exe().unwrap()).unwrap()
+        ));
+    }
+
+    #[test]
+    fn cidrs_contain_ip_accepts_cidrs_and_bare_hosts() {
+        let cidrs: Vec<String> = ["10.0.0.0/8", "172.16.1.5", "2001:db8::/32", "invalid"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for ip in ["10.0.0.53", "172.16.1.5", "2001:db8::53"] {
+            assert!(cidrs_contain_ip(&cidrs, ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["11.0.0.1", "172.16.1.6", "2001:db9::53"] {
+            assert!(!cidrs_contain_ip(&cidrs, ip.parse().unwrap()), "{ip}");
+        }
+        assert!(cidrs_contain_ip(
+            &["0.0.0.0/0".to_string()],
+            "8.8.8.8".parse().unwrap()
+        ));
+        assert!(!cidrs_contain_ip(&[], "8.8.8.8".parse().unwrap()));
     }
 
     #[test]

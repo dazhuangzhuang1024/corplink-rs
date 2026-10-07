@@ -42,7 +42,6 @@ if /bin/launchctl print "${SERVICE_TARGET}" >/dev/null 2>&1; then
     /bin/launchctl bootout "${SERVICE_TARGET}"
 fi
 
-/bin/launchctl disable "${SERVICE_TARGET}" >/dev/null 2>&1 || true
 if [[ -e "${INSTALLED_PLIST}" ]]; then
     /bin/rm -f "${INSTALLED_PLIST}"
 fi

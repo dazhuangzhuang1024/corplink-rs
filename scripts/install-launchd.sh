@@ -23,6 +23,10 @@ fi
 config_path="${REPO_ROOT}/config.json"
 vpn_server_name=""
 rust_log="corplink_rs=info"
+# options not given again on a reinstall keep their installed values
+config_given=0
+vpn_server_given=0
+log_filter_given=0
 
 usage() {
     cat <<EOF
@@ -32,9 +36,11 @@ Options:
   --binary PATH       source corplink-rs executable
                       (default: ${source_binary_path})
   --config PATH       config file passed to corplink-rs
-                      (default: ${config_path})
-  --vpn-server NAME   override the configured VPN server name
-  --log-filter VALUE  RUST_LOG value (default: ${rust_log})
+                      (default: the installed one, else ${config_path})
+  --vpn-server NAME   override the configured VPN server name; '' clears it
+                      (default: the installed one, else none)
+  --log-filter VALUE  RUST_LOG value
+                      (default: the installed one, else ${rust_log})
   -h, --help          show this help
 EOF
 }
@@ -58,16 +64,19 @@ while [[ $# -gt 0 ]]; do
         --config)
             require_value "$@"
             config_path="$2"
+            config_given=1
             shift 2
             ;;
         --vpn-server)
-            require_value "$@"
+            [[ $# -ge 2 ]] || die "$1 requires a value"
             vpn_server_name="$2"
+            vpn_server_given=1
             shift 2
             ;;
         --log-filter)
             require_value "$@"
             rust_log="$2"
+            log_filter_given=1
             shift 2
             ;;
         -h|--help)
@@ -82,7 +91,28 @@ done
 
 [[ ${EUID} -eq 0 ]] || die "run this installer with sudo"
 [[ -f "${TEMPLATE_PATH}" ]] || die "launchd template not found: ${TEMPLATE_PATH}"
-[[ -f "${config_path}" ]] || die "config file not found: ${config_path}"
+
+installed_value() {
+    /usr/bin/plutil -extract "$1" raw "${INSTALLED_PLIST}" 2>/dev/null
+}
+config_origin=""
+if [[ -f "${INSTALLED_PLIST}" ]]; then
+    if [[ "${config_given}" -eq 0 ]] && previous="$(installed_value ProgramArguments.1)"; then
+        config_path="${previous}"
+        config_origin=" (from ${INSTALLED_PLIST}; pass --config to use another file)"
+    fi
+    if [[ "${vpn_server_given}" -eq 0 ]] &&
+        previous="$(installed_value EnvironmentVariables.CORPLINK_VPN_SERVER_NAME)"; then
+        vpn_server_name="${previous}"
+    fi
+    if [[ "${log_filter_given}" -eq 0 ]] && previous="$(installed_value EnvironmentVariables.RUST_LOG)"; then
+        rust_log="${previous}"
+    fi
+fi
+
+[[ ! -L "${config_path}" ]] || \
+    die "config file is a symlink: ${config_path}${config_origin}; corplink-rs refuses it, pass the real file"
+[[ -f "${config_path}" ]] || die "config file not found: ${config_path}${config_origin}"
 [[ -f "${source_binary_path}" && -x "${source_binary_path}" ]] || \
     die "executable not found: ${source_binary_path}; build or unpack corplink-rs first"
 
@@ -135,22 +165,58 @@ source_binary_path="$(absolute_file_path "${source_binary_path}")"
 config_path="$(absolute_file_path "${config_path}")"
 working_directory="$(dirname "${config_path}")"
 
+# relative to the home directory: `*` in a case pattern also matches `/`
+case "${config_path}" in
+    /Users/*/*) home_relative="${config_path#/Users/*/}" ;;
+    *) home_relative="" ;;
+esac
+case "${home_relative}" in
+    Desktop/* | Documents/* | Downloads/* | "Library/Mobile Documents/"* | Library/CloudStorage/*)
+        protected=1
+        ;;
+    *)
+        [[ "${config_path}" == /Volumes/* ]] && protected=1 || protected=0
+        ;;
+esac
+if [[ "${protected}" -eq 1 ]]; then
+    echo "warning: ${config_path} is in a privacy-protected location; a launchd daemon cannot read it without Full Disk Access, consider moving it" >&2
+fi
+if (( 8#$(/usr/bin/stat -f '%Lp' "${config_path}") & 8#077 )); then
+    echo "warning: ${config_path} is readable by other users but holds credentials and the WireGuard private key; consider chmod 600" >&2
+fi
+if (( 8#$(/usr/bin/stat -f '%Lp' "${working_directory}") & 8#022 )); then
+    echo "warning: ${working_directory} is writable by other users, who could then control the root daemon through its config" >&2
+fi
+echo "Config:     ${config_path}"
+echo "VPN server: ${vpn_server_name:-(from config)}"
+echo "RUST_LOG:   ${rust_log}"
+
 temporary_plist=""
 temporary_binary=""
 backup_plist=""
 backup_binary=""
 lock_acquired=0
 state_modified=0
+completed=0
 old_job_loaded=0
 
 cleanup() {
     local status=$?
     trap - EXIT
+    # finish the rollback even when interrupted again; children inherit this
+    trap '' HUP INT TERM
     set +e
 
-    if [[ "${status}" -ne 0 && "${state_modified}" -eq 1 ]]; then
+    # rolls back on any exit before completion, also after a signal, where
+    # bash 3.2 reports status 0 to the EXIT trap
+    if [[ "${state_modified}" -eq 1 && "${completed}" -eq 0 ]]; then
+        [[ "${status}" -ne 0 ]] || status=1
         echo "Installation failed; rolling back the previous launchd state..." >&2
+        new_pid="$(job_pid)"
         /bin/launchctl bootout "${SERVICE_TARGET}" >/dev/null 2>&1 || true
+        # bootout can return before the processes are gone
+        wait_for_pid_exit "${new_pid}"
+        wait_for_pid_exit "${old_pid:-}"
 
         if [[ -n "${backup_plist}" && -f "${backup_plist}" ]]; then
             /usr/bin/install -o root -g wheel -m 0644 "${backup_plist}" "${INSTALLED_PLIST}"
@@ -170,8 +236,17 @@ cleanup() {
                 /bin/launchctl enable "${SERVICE_TARGET}" >/dev/null 2>&1 || true
                 /bin/launchctl bootstrap system "${INSTALLED_PLIST}" >/dev/null 2>&1 || true
                 /bin/launchctl kickstart "${SERVICE_TARGET}" >/dev/null 2>&1 || true
+                /bin/sleep 2
+                rollback_pid="$(job_pid)"
+                if [[ -n "${rollback_pid}" ]]; then
+                    echo "The previous service is running again (PID ${rollback_pid})." >&2
+                elif /bin/launchctl print "${SERVICE_TARGET}" >/dev/null 2>&1; then
+                    echo "The previous service is loaded but not running; check sudo launchctl print ${SERVICE_TARGET} and ${ERROR_LOG_PATH}." >&2
+                else
+                    echo "The previous service did not come back; start it with: sudo launchctl bootstrap system ${INSTALLED_PLIST}" >&2
+                fi
             else
-                echo "Old job was not restarted because another process exists or process inspection failed (PID(s): ${rollback_pids:-unknown})." >&2
+                echo "Old job was not restarted because another process exists or process inspection failed (PID(s): ${rollback_pids:-unknown}); once it is gone, start it with: sudo launchctl bootstrap system ${INSTALLED_PLIST}" >&2
             fi
         fi
     fi
@@ -187,6 +262,9 @@ cleanup() {
     exit "${status}"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 temporary_plist="$(/usr/bin/mktemp -t corplink-rs-launchd-plist)"
 temporary_binary="$(/usr/bin/mktemp -t corplink-rs-launchd-binary)"
@@ -213,6 +291,14 @@ fi
 /bin/mkdir "${LOCK_DIRECTORY}" 2>/dev/null || \
     die "another launchd install or uninstall is already running"
 lock_acquired=1
+
+# checked before the running service is touched
+binary_directory="$(dirname "${INSTALLED_BINARY}")"
+require_secure_directory "$(dirname "${binary_directory}")"
+if [[ ! -d "${binary_directory}" ]]; then
+    /usr/bin/install -d -o root -g wheel -m 0755 "${binary_directory}"
+fi
+require_secure_directory "${binary_directory}"
 
 if [[ -e "${INSTALLED_PLIST}" ]]; then
     backup_plist="$(/usr/bin/mktemp -t corplink-rs-launchd-old-plist)"
@@ -247,12 +333,6 @@ fi
 running_pids="$(process_pids)"
 [[ -z "${running_pids}" ]] || die "a corplink-rs process appeared during installation"
 
-binary_directory="$(dirname "${INSTALLED_BINARY}")"
-require_secure_directory "$(dirname "${binary_directory}")"
-if [[ ! -d "${binary_directory}" ]]; then
-    /usr/bin/install -d -o root -g wheel -m 0755 "${binary_directory}"
-fi
-require_secure_directory "${binary_directory}"
 /usr/bin/install -o root -g wheel -m 0755 "${temporary_binary}" "${INSTALLED_BINARY}"
 /usr/bin/touch "${LOG_PATH}" "${ERROR_LOG_PATH}"
 /usr/sbin/chown root:wheel "${LOG_PATH}" "${ERROR_LOG_PATH}"
@@ -277,10 +357,11 @@ for ((attempt = 0; attempt < 30; attempt++)); do
     /bin/sleep 1
 done
 
-[[ -n "${ready_pid}" ]] || die "launchd did not start an owned corplink-rs process"
+[[ -n "${ready_pid}" ]] || die "launchd did not start an owned corplink-rs process; its output is in ${ERROR_LOG_PATH}, before the rollback's"
 /bin/sleep 2
 [[ "$(job_pid)" == "${ready_pid}" && "$(process_pids)" == "${ready_pid}" ]] || \
-    die "the launchd process did not remain stable after startup"
+    die "the launchd process did not remain stable after startup; its output is in ${ERROR_LOG_PATH}, before the rollback's"
+completed=1
 
 echo "Installed and started ${SERVICE_TARGET}."
 echo "PID: ${ready_pid}"

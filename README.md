@@ -134,6 +134,8 @@ cargo build --release
 sudo ./target/release/corplink-rs "$PWD/config.json"
 ```
 
+如果每次连接都要输入 2FA 验证码（服务端没有下发 TOTP 密钥，`config.json` 里没有 `code`），后台服务无法自动连接。
+
 然后安装并立即启动后台服务：
 
 ```bash
@@ -157,18 +159,26 @@ plist 设置了 `RunAtLoad`，因此以后开机时会自动启动。已经安�
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist
 ```
 
-脚本不会复制或修改 `config.json`，只把它的绝对路径传给程序。工作目录会设为配置文件所在目录，以保证 cookie 的读取和保存位置一致，因此安装后不要移动配置文件。
+脚本不会复制或修改 `config.json`，只把它的绝对路径传给程序，cookie 保存在配置文件所在目录，因此安装后不要移动配置文件。配置文件不要放在 `~/Desktop`、`~/Documents`、`~/Downloads`、iCloud、`~/Library/CloudStorage` 或外接卷上，LaunchDaemon 没有完全磁盘访问权限时读不到这些位置。
 
-服务以 root 身份读取配置和保存 cookie，应限制这些文件的读取权限，并且只允许可信管理员修改配置目录。程序会拒绝通过符号链接回写配置或 cookie。
+服务以 root 身份读取配置和保存 cookie，应限制这些文件的读取权限，并且只允许可信管理员修改配置目录。程序拒绝使用符号链接形式的配置文件，也不会通过符号链接回写 cookie。
 
-更新源码后，使用相同流程重编并重装。安装脚本会优雅停止旧服务、替换 `/usr/local/bin/corplink-rs` 和 plist，再启动一个新实例；失败时会恢复旧二进制和服务：
+更新源码后，使用相同流程重编并重装。安装脚本会优雅停止旧服务、替换 `/usr/local/bin/corplink-rs` 和 plist，再启动一个新实例；失败时会恢复旧二进制和服务。重装时没有传入的 `--config`、`--vpn-server`、`--log-filter` 沿用已安装的值，`--vpn-server ''` 可以取消指定节点：
 
 ```bash
+git pull
 ./libwg/build.sh
 cargo build --release
-sudo ./scripts/install-launchd.sh \
-  --vpn-server Node03 \
-  --log-filter corplink_rs=debug
+sudo ./scripts/install-launchd.sh
+```
+
+登录态失效后（日志中出现 `needs input, but stdin is not usable` 并提示重新登录），服务无法自己重新扫码或输入验证码，需要先停止服务，用服务所用的配置文件在前台重新登录，再启动服务：
+
+```bash
+plist=/Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist
+sudo launchctl bootout system/com.github.pinkd.corplink-rs
+sudo /usr/local/bin/corplink-rs "$(plutil -extract ProgramArguments.1 raw "$plist")"   # 登录并看到 VPN 已连接后按 Ctrl+C
+sudo launchctl bootstrap system "$plist"
 ```
 
 状态、日志、重启和卸载：
@@ -189,7 +199,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.pinkd.corplink
 sudo ./scripts/uninstall-launchd.sh
 ```
 
-LaunchDaemon 本身以 root 身份运行，plist 的 `ProgramArguments` 中不应再加入 `sudo`。服务会在开机时启动，并在进程异常退出（包括握手超时）后重新拉起；如果进程频繁退出，启动频率会被限制为最多每 60 秒一次。
+LaunchDaemon 本身以 root 身份运行，plist 的 `ProgramArguments` 中不应再加入 `sudo`。服务会在开机时启动，并在进程异常退出（包括握手超时，以及启动后 5 分钟内一直没有握手成功）后重新拉起；如果进程频繁退出，启动频率会被限制为最多每 60 秒一次。
 
 ## log level 配置
 
@@ -254,6 +264,19 @@ RUST_LOG=debug ./corplink-rs config.json
   //   and write a new one with the VPN-provided nameserver)
   // NOTE: if process doesn't exit gracefully, your dns may not be restored
   "use_vpn_dns": false,
+  // macOS only: per-domain split DNS. on every connect the daemon writes
+  // /etc/resolver/<domain> files pointing at the DNS assigned for that
+  // session (it can change between sessions) and removes them on shutdown,
+  // so intranet domains resolve via the VPN without touching system-wide
+  // DNS settings. include CNAME target domains: macOS resolves the follow-up
+  // query with the resolver matching the target domain, which falls back to
+  // the default DNS if it is not listed.
+  // existing /etc/resolver files not written by corplink-rs are left alone.
+  // needs interface_name of the form utunN, e.g. utun12345
+  // NOTE: if process doesn't exit gracefully, the files are removed on the
+  //   next start; if you stop using corplink-rs after a crash, delete the
+  //   /etc/resolver files starting with "# managed by corplink-rs" with sudo
+  "split_dns_domains": ["intranet.example.com", "cname-target.internal.example"],
   // optional: filename for the Linux backup of /etc/resolv.conf.
   // Default "resolv.conf.corplink", always placed next to /etc/resolv.conf.
   // macOS ignores this field.

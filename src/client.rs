@@ -44,22 +44,38 @@ fn cookie_file_path(conf: &Config) -> Result<path::PathBuf> {
     let directory = path::Path::new(config_file)
         .parent()
         .unwrap_or_else(|| path::Path::new("."));
-    Ok(directory.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX)))
+    // the daemon writes this file as root, so the name from the config must
+    // stay a single file name inside the config directory
+    let file_name = format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX);
+    let mut components = path::Path::new(&file_name).components();
+    match (components.next(), components.next()) {
+        (Some(path::Component::Normal(_)), None) => {}
+        _ => bail!("invalid interface name {interface_name:?}"),
+    }
+    Ok(directory.join(file_name))
 }
 
+// the cookies are login credentials: readable by the owner only
 fn open_cookie_file_for_write(cookie_file: &path::Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
     }
-    options.open(cookie_file)
+    let file = options.open(cookie_file)?;
+    // also narrow a file created by an older version
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn matches_vpn_server_name(vpn: &RespVpnInfo, expected: Option<&str>) -> bool {
-    expected.map_or(true, |name| vpn.name == name || vpn.en_name == name)
+    expected.is_none_or(|name| vpn.name == name || vpn.en_name == name)
 }
 
 fn merge_additional_routes(
@@ -215,12 +231,15 @@ impl Client {
         let mut cookie_store = {
             let file = fs::File::open(&cookie_file).map(io::BufReader::new);
             match file {
-                Ok(file) => CookieStore::load_json_all(file).or_else(|e| {
-                    bail!(
-                        "failed to load cookie store from {}: {e}",
+                // a broken file would otherwise fail every start, under launchd
+                // forever; the next save replaces it
+                Ok(file) => CookieStore::load_json_all(file).unwrap_or_else(|e| {
+                    log::warn!(
+                        "ignoring unreadable cookie file {}: {e}",
                         cookie_file.display()
-                    )
-                })?,
+                    );
+                    CookieStore::default()
+                }),
                 Err(_) => CookieStore::default(),
             }
         };
@@ -300,6 +319,9 @@ impl Client {
             .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
         c.save_json(&mut file)
             .or_else(|e| bail!("failed to persist cookies to disk: {e}"))?;
+        // BufWriter would otherwise flush on drop and swallow the error
+        io::Write::flush(&mut file)
+            .with_context(|| format!("failed to write cookie file {}", cookie_file.display()))?;
         Ok(())
     }
 
@@ -433,6 +455,11 @@ impl Client {
         url: &String,
         token: &String,
     ) -> Result<String> {
+        utils::ensure_interactive(
+            "the QR code login",
+            "stop the service, run corplink-rs once in a terminal to log in, then start the \
+             service again",
+        )?;
         log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
         match TerminalQrCode::from_bytes(url.as_bytes()) {
@@ -754,6 +781,11 @@ impl Client {
     }
 
     async fn login_with_email(&mut self) -> Result<String> {
+        utils::ensure_interactive(
+            "the email code login",
+            "stop the service, run corplink-rs once in a terminal to log in, then start the \
+             service again",
+        )?;
         // tell server to send code to email
         log::info!("try to request code for email");
         self.request_email_code().await?;
@@ -1036,6 +1068,11 @@ impl Client {
             if is_tps_login {
                 log::info!("use empty 2fa code (tps login already verified)");
             } else {
+                utils::ensure_interactive(
+                    "connecting",
+                    "a 2fa code is needed on every connect because config.json has no `code`, \
+                     so corplink-rs cannot connect unattended",
+                )?;
                 log::info!("input your 2fa code:");
                 otp = utils::read_line().await?;
             }
@@ -1074,6 +1111,18 @@ impl Client {
                 .map(|i| i.en_name.clone())
                 .collect::<Vec<String>>()
         );
+        if let Some(name) = self.conf.effective_vpn_server_name() {
+            if !vpn_info
+                .iter()
+                .any(|vpn| matches_vpn_server_name(vpn, Some(name)))
+            {
+                let available: Vec<String> = vpn_info
+                    .iter()
+                    .map(|vpn| format!("{}/{}", vpn.name, vpn.en_name))
+                    .collect();
+                bail!("no VPN server named {name:?}, available: {available:?}");
+            }
+        }
         let filtered_vpn = vpn_info
             .into_iter()
             .filter(|vpn| {
@@ -1144,6 +1193,21 @@ impl Client {
         log::info!("try to get wg conf from remote");
         let wg_info = self.fetch_peer_info(&key).await?;
         let mtu = wg_info.setting.vpn_mtu;
+        // informational: the configured split_dns_domains stays the source of
+        // truth for which /etc/resolver files get written, but the server list
+        // helps verify it covers everything it should
+        if let Some(domains) = &wg_info.setting.vpn_dns_domain_split {
+            if self
+                .conf
+                .split_dns_domains
+                .as_ref()
+                .is_some_and(|d| !d.is_empty())
+            {
+                log::info!("server-advertised split dns domains: {domains:?}");
+            } else {
+                log::debug!("server-advertised split dns domains: {domains:?}");
+            }
+        }
         let dns = wg_info.setting.vpn_dns;
         let peer_key = wg_info.public_key;
         let public_key = self
@@ -1447,8 +1511,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        matches_vpn_server_name, merge_additional_routes, open_cookie_file_for_write,
-        resolve_additional_domains, Client, ReqwestCookieStore,
+        cookie_file_path, matches_vpn_server_name, merge_additional_routes,
+        open_cookie_file_for_write, resolve_additional_domains, Client, ReqwestCookieStore,
     };
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
@@ -1536,6 +1600,76 @@ mod tests {
 
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_file(&target).unwrap();
+    }
+
+    #[test]
+    fn cookie_file_stays_in_the_config_directory() {
+        let mut conf: Config =
+            serde_json::from_str(r#"{"company_name":"test","username":"test"}"#).unwrap();
+        conf.conf_file = Some("/etc/corplink/config.json".to_string());
+
+        conf.interface_name = Some("utun12345".to_string());
+        assert_eq!(
+            cookie_file_path(&conf).unwrap(),
+            std::path::Path::new("/etc/corplink/utun12345_cookies.json")
+        );
+        conf.interface_name = Some("..".to_string());
+        assert_eq!(
+            cookie_file_path(&conf).unwrap(),
+            std::path::Path::new("/etc/corplink/.._cookies.json")
+        );
+        for name in ["../x", "/tmp/x", "a/b", "a/../../b"] {
+            conf.interface_name = Some(name.to_string());
+            assert!(cookie_file_path(&conf).is_err(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cookie_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("corplink-cookie-mode-{unique}"));
+        // left world-readable by an older version
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        drop(open_cookie_file_for_write(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn an_unreadable_cookie_file_is_ignored() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let interface_name = format!("corplink-broken-cookie-{unique}");
+        let cookie_file = std::env::temp_dir().join(format!("{interface_name}_cookies.json"));
+        std::fs::write(&cookie_file, b"{\"truncated").unwrap();
+
+        let mut conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "server": "http://127.0.0.1",
+            "interface_name": interface_name,
+        }))
+        .unwrap();
+        conf.conf_file = Some(
+            std::env::temp_dir()
+                .join(format!("{interface_name}.json"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let client = Client::new(conf);
+        std::fs::remove_file(&cookie_file).unwrap();
+        assert!(client.is_ok());
     }
 
     fn test_client() -> Client {
