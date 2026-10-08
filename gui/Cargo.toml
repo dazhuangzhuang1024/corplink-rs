@@ -1,0 +1,18 @@
+[package]
+name = "corplink-gui"
+version = "0.6.0"
+edition = "2021"
+description = "corplink-rs menu-bar GUI"
+
+[[bin]]
+name = "corplink-gui"
+path = "src/main.rs"
+
+# macOS only: elsewhere the binary is a stub, so that `cargo build --workspace`
+# needs no tray/GUI system libraries there
+[target.'cfg(target_os = "macos")'.dependencies]
+corplink-ipc = { path = "../ipc" }
+eframe = "0.29"
+egui = "0.29"
+tray-icon = "0.13"
+qrcode = "0.14"

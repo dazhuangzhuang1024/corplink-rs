@@ -24,3 +24,5 @@ libwg/libwg.h
 # release artifacts
 /release/
 *.zip
+dist/
+.zcode/

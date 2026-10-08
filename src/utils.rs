@@ -38,7 +38,7 @@ pub fn ensure_interactive(what: &str, hint: &str) -> Result<()> {
     ))
 }
 
-fn stdin_is_usable() -> bool {
+pub(crate) fn stdin_is_usable() -> bool {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;

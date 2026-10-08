@@ -201,6 +201,24 @@ sudo ./scripts/uninstall-launchd.sh
 
 LaunchDaemon 本身以 root 身份运行，plist 的 `ProgramArguments` 中不应再加入 `sudo`。服务会在开机时启动，并在进程异常退出（包括握手超时，以及启动后 5 分钟内一直没有握手成功）后重新拉起；如果进程频繁退出，启动频率会被限制为最多每 60 秒一次。
 
+### macOS 菜单栏图形界面（corplink-gui）
+
+守护进程自带一个菜单栏控制器（类似 ClashX 的形态）：状态栏常驻图标按连接状态变色（灰=未连接、橙=连接中、绿=已连接、红=需要登录），点开菜单可以连接/断开/重连、按延迟切换节点、弹出登录窗口（扫码/验证码，不再需要停服务进终端）、查看实时日志。安装/卸载守护进程仍走上面的脚本，GUI 只是遥控器：退出 GUI 不影响 VPN。
+
+GUI 通过 `/var/run/corplink-rs.sock`（可用 `CORPLINK_IPC_SOCK` 覆盖）与守护进程通信，连接只接受 root 和配置文件属主，多用户机器上其他用户无法操控或读取日志。
+
+构建 DMG（ad-hoc 签名，本机可直接用；传给别人首次打开需要"系统设置 → 隐私与安全性 → 仍要打开"）：
+
+```bash
+./scripts/build-gui-dmg.sh   # 产物在 dist/corplink-gui-<version>.dmg
+```
+
+只构建二进制（调试用，不经 .app 启动会在 Dock 出现图标）：`cargo build -p corplink-gui`。
+
+0.6.0 起守护进程是常驻进程：GUI 连接过一次后，断开 VPN 只回到 Idle 而不退出进程（launchd 的 KeepAlive 不会拉起干净退出的进程）；握手超时在进程内直接重连，跳过 launchd 的重启节流；连接失败按 10s 起翻倍的间隔自动重试 5 次，仍失败则停在 Idle，等你从菜单重新连接。登录态过期、需要扫码或输入验证码时进入"需要登录"状态安静等待 GUI，而不是每 60 秒重启一次（邮箱验证码登录也不会在没人能输入时先发出验证码）；登录提示 10 分钟无人应答同样回到"需要登录"，不会自动重试。从未有 GUI 连接过时，其余行为与旧版一致：连接失败或握手超时都会退出交给 launchd 拉起。
+
+GUI 只支持 macOS：Linux/Windows 上守护进程不创建 socket，行为与旧版完全一致（需要登录时直接报错退出，交给 systemd 等处理）。socks5/netstack 模式下 libwg 无法在同一进程内重启隧道，因此隧道起来后 GUI 的连接/断开/切换节点会被拒绝，握手超时仍然退出进程，需要重启 corplink-rs。
+
 ## log level 配置
 
 本项目使用 [env_logger](https://docs.rs/env_logger/latest/env_logger/) 作为 log 库，修改 log level 需要使用环境变量，示例：

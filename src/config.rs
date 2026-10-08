@@ -498,4 +498,6 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+    // which server this conf came from, for status display (not wg config)
+    pub server_name: String,
 }

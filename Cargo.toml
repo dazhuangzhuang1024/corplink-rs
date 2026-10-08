@@ -1,9 +1,18 @@
 [package]
 name = "corplink-rs"
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
 
+# `cargo build`/`cargo test` keep building only the daemon; the GUI and the
+# shared IPC protocol live in workspace members and are built on demand with
+# `cargo build -p corplink-gui` etc.
+[workspace]
+members = ["ipc", "gui"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
+corplink-ipc = { path = "ipc" }
 regex = "1.10"
 reqwest = { version = "0.11", features = [
     "json",

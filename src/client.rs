@@ -24,11 +24,12 @@ use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
-use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
+use crate::ui::{LoginUi, PromptError};
 use crate::utils;
+use corplink_ipc::LoginPrompt;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 
@@ -175,6 +176,15 @@ fn corplink_client_builder() -> ClientBuilder {
 #[derive(Clone)]
 pub struct Client {
     conf: Config,
+    // how the login flow asks a human: the terminal for a foreground run,
+    // the GUI over IPC for the daemon
+    ui: LoginUi,
+    // the server choice the client started with (CORPLINK_VPN_SERVER_NAME),
+    // which unpinning the GUI's choice goes back to
+    startup_vpn_server: Option<String>,
+    // false for a probe next to the session's client: the cookie and config
+    // files are the session's, and a second writer would race it
+    persist: bool,
     cookie: Arc<CookieStoreMutex>,
     c: reqwest::Client,
     probe_client: reqwest::Client,
@@ -224,7 +234,7 @@ pub async fn get_company_url(code: &str) -> anyhow::Result<RespCompany> {
 }
 
 impl Client {
-    pub fn new(conf: Config) -> Result<Client> {
+    pub fn new(conf: Config, ui: LoginUi) -> Result<Client> {
         let cookie_file = cookie_file_path(&conf)?;
         log::info!("cookie file is: {}", cookie_file.to_string_lossy());
 
@@ -288,7 +298,10 @@ impl Client {
             .context("build http client")?;
         let conf_bak = conf.clone();
         Ok(Client {
+            startup_vpn_server: conf.vpn_server_name_override.clone(),
             conf,
+            ui,
+            persist: true,
             cookie: Arc::clone(&cookie_store),
             c,
             probe_client,
@@ -297,13 +310,32 @@ impl Client {
         })
     }
 
+    /// A client that measures the server list next to the session's client
+    /// (see [`Client::probe_vpn_list`]). It starts from the files' state and
+    /// never writes the cookie or config file back: both belong to the
+    /// session's client, which may be saving them at the same moment.
+    pub fn new_probe(conf: Config) -> Result<Client> {
+        let mut client = Client::new(conf, LoginUi::terminal())?;
+        client.persist = false;
+        Ok(client)
+    }
+
     async fn change_state(&mut self, state: State) -> Result<()> {
         self.conf.state = Some(state);
-        self.conf.save().await?;
-        Ok(())
+        self.save_conf().await
+    }
+
+    async fn save_conf(&self) -> Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
+        self.conf.save().await
     }
 
     fn save_cookie(&self) -> Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
         let cookie_file = cookie_file_path(&self.conf)?;
         let mut file = open_cookie_file_for_write(&cookie_file)
             .map(io::BufWriter::new)
@@ -427,6 +459,45 @@ impl Client {
         matches!(self.conf.state.as_ref(), None | Some(State::Init))
     }
 
+    /// Pins the VPN server for the next connects (runtime only, never
+    /// persisted, like the CORPLINK_VPN_SERVER_NAME override); `None` goes
+    /// back to the choice the client started with.
+    pub fn set_vpn_server_override(&mut self, name: Option<String>) {
+        self.conf.vpn_server_name_override = name.or_else(|| self.startup_vpn_server.clone());
+    }
+
+    /// The whole server list with this probe round's latency per entry
+    /// (`None` when the entry did not answer), in server-list order. Unlike
+    /// the connect-time strategies this keeps every row: it feeds the GUI's
+    /// server picker.
+    pub async fn probe_vpn_list(&mut self) -> Result<Vec<(RespVpnInfo, Option<i64>)>> {
+        let vpn_info = self.list_vpn().await?;
+        // the pings only read; a shared reborrow lets them run concurrently
+        let this: &Client = self;
+        let mut probes = vpn_info
+            .into_iter()
+            .enumerate()
+            .map(|(index, vpn)| async move {
+                let latency = this
+                    .ping_vpn(&vpn.ip, vpn.api_port)
+                    .await
+                    .ok()
+                    .map(|r| r.latency_ms);
+                (index, vpn, latency)
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut out: Vec<Option<(RespVpnInfo, Option<i64>)>> =
+            std::iter::repeat_with(|| None).take(probes.len()).collect();
+        while let Some((index, vpn, latency)) = probes.next().await {
+            match latency {
+                Some(ms) => log::info!("server name {}, latency {}ms", vpn.en_name, ms),
+                None => log::warn!("no probe answer from {}", vpn.en_name),
+            }
+            out[index] = Some((vpn, latency));
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
     async fn check_tps_token(&mut self, token: &String) -> Result<String> {
         // tps confirmed, try to login with token
         let mut m = Map::new();
@@ -455,27 +526,17 @@ impl Client {
         url: &String,
         token: &String,
     ) -> Result<String> {
-        utils::ensure_interactive(
-            "the QR code login",
-            "stop the service, run corplink-rs once in a terminal to log in, then start the \
-             service again",
-        )?;
         log::info!("old token is: {token}");
-        log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
-        match TerminalQrCode::from_bytes(url.as_bytes()) {
-            Ok(qr) => qr.print(),
-            Err(e) => {log::warn!("failed to generate qr code: {e}");}
-        }
+        // the QR code and the "scanned?" confirmation come from the terminal
+        // or, for the daemon, from the GUI over IPC
+        self.ui.qr_confirm(url).await?;
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
-                log::info!("press enter if you finish auth");
-                let stdin = io::stdin();
-                stdin.lines().next();
                 self.check_tps_token(token).await
             }
             _ => {
                 // TODO: add all tps login support
-                bail!("unsupported platform, please contact the developer");
+                bail!("unsupported platform, please contact the developer")
             }
         }
     }
@@ -629,7 +690,7 @@ impl Client {
                             if k == "secret" {
                                 log::info!("got 2fa token: {}", &v);
                                 self.conf.code = Some(v.to_string());
-                                self.conf.save().await?;
+                                self.save_conf().await?;
                                 break;
                             }
                         }
@@ -666,6 +727,12 @@ impl Client {
         for method in resp.login_orders {
             let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method).await;
             if let Err(e) = otp_uri {
+                // a prompt nobody answered (cancelled, no UI, timed out) is
+                // no reason to try the next method: it would only ask again,
+                // or mail another code, and the caller needs to see why
+                if e.chain().any(|cause| cause.is::<PromptError>()) {
+                    return Err(e);
+                }
                 log::warn!("failed to login with method {method}: {e}");
                 continue;
             }
@@ -682,7 +749,7 @@ impl Client {
                 if k == "secret" {
                     log::info!("got 2fa token: {}", &v);
                     self.conf.code = Some(v.to_string());
-                    self.conf.save().await?;
+                    self.save_conf().await?;
                     break;
                 }
             }
@@ -781,18 +848,17 @@ impl Client {
     }
 
     async fn login_with_email(&mut self) -> Result<String> {
-        utils::ensure_interactive(
-            "the email code login",
-            "stop the service, run corplink-rs once in a terminal to log in, then start the \
-             service again",
-        )?;
+        // fail before the server mails a code nobody could enter: the
+        // unattended daemon would send a fresh one on every start
+        self.ui
+            .ensure_answerable()
+            .context("the email code login")?;
         // tell server to send code to email
         log::info!("try to request code for email");
         self.request_email_code().await?;
 
-        log::info!("input your code from email:");
-        let input = utils::read_line().await?;
-        let code = input.trim();
+        let code = self.ui.read_code(LoginPrompt::EmailCode).await?;
+        let code = code.trim();
         let mut m = Map::new();
         m.insert("forget_password".to_string(), json!(false));
         m.insert("code_type".to_string(), json!("email"));
@@ -1068,13 +1134,8 @@ impl Client {
             if is_tps_login {
                 log::info!("use empty 2fa code (tps login already verified)");
             } else {
-                utils::ensure_interactive(
-                    "connecting",
-                    "a 2fa code is needed on every connect because config.json has no `code`, \
-                     so corplink-rs cannot connect unattended",
-                )?;
-                log::info!("input your 2fa code:");
-                otp = utils::read_line().await?;
+                let code = self.ui.read_code(LoginPrompt::TwoFa).await?;
+                otp = code.trim().to_string();
             }
         }
         let mut m = Map::new();
@@ -1382,6 +1443,7 @@ impl Client {
             allowed_ips,
             routes,
             dns,
+            server_name: vpn.en_name.clone(),
             // `force_protocol`, when set, overrides the server-advertised `protocol_mode`
             protocol: match self.conf.force_protocol.as_deref() {
                 Some(p) if p.eq_ignore_ascii_case("udp") => 0,
@@ -1667,7 +1729,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let client = Client::new(conf);
+        let client = Client::new(conf, crate::ui::LoginUi::terminal());
         std::fs::remove_file(&cookie_file).unwrap();
         assert!(client.is_ok());
     }
@@ -1691,7 +1753,34 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        Client::new(conf).unwrap()
+        Client::new(conf, crate::ui::LoginUi::terminal()).unwrap()
+    }
+
+    #[test]
+    fn unpinning_the_vpn_server_goes_back_to_the_startup_choice() {
+        let mut conf = test_client().conf;
+        conf.vpn_server_name_override = Some("from-env".to_string());
+        let mut client = Client::new(conf, crate::ui::LoginUi::terminal()).unwrap();
+
+        client.set_vpn_server_override(Some("from-gui".to_string()));
+        assert_eq!(client.conf.effective_vpn_server_name(), Some("from-gui"));
+        // a connect without a pin must not drop CORPLINK_VPN_SERVER_NAME
+        client.set_vpn_server_override(None);
+        assert_eq!(client.conf.effective_vpn_server_name(), Some("from-env"));
+    }
+
+    #[tokio::test]
+    async fn a_probe_client_never_writes_the_session_files() {
+        let conf = test_client().conf;
+        let cookie_file = cookie_file_path(&conf).unwrap();
+        let conf_file = conf.conf_file.clone().unwrap();
+        let mut probe = Client::new_probe(conf).unwrap();
+
+        probe.save_cookie().unwrap();
+        // what a logout answer to a probe does
+        probe.change_state(crate::state::State::Init).await.unwrap();
+        assert!(!cookie_file.exists());
+        assert!(!std::path::Path::new(&conf_file).exists());
     }
 
     #[tokio::test]
@@ -1854,5 +1943,168 @@ mod tests {
         let routes = resolve_additional_domains(&["127.0.0.1".to_string()], false).await;
 
         assert_eq!(routes, vec!["127.0.0.1/32"]);
+    }
+
+    /// A corplink API stand-in: answers every request with the JSON routed by
+    /// its path and records the paths it was asked for.
+    async fn start_api_server(
+        routes: &'static [(&'static str, &'static str)],
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&paths);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    let head_end = loop {
+                        let count = stream.read(&mut buffer).await.unwrap();
+                        if count == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+                    let body_len = head
+                        .lines()
+                        .find_map(|line| {
+                            let line = line.to_ascii_lowercase();
+                            line.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    // read the body too: closing on unread data resets the
+                    // connection before the client sees the answer
+                    while request.len() < head_end + body_len {
+                        let count = stream.read(&mut buffer).await.unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    let target = head.split_whitespace().nth(1).unwrap_or_default();
+                    let path = target.split('?').next().unwrap_or_default().to_string();
+                    let body = routes
+                        .iter()
+                        .find(|(route, _)| *route == path)
+                        .map_or(r#"{"code":404,"message":"no route"}"#, |(_, body)| *body);
+                    seen.lock().unwrap().push(path);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (url, paths)
+    }
+
+    // QR login first, then the email code login
+    const LOGIN_ROUTES: &[(&str, &str)] = &[
+        (
+            "/api/login/setting",
+            r#"{"code":0,"data":{"login_enable_ldap":false,"login_enable":true,"login_orders":["lark","feilian"]}}"#,
+        ),
+        (
+            "/api/tpslogin/link",
+            r#"{"code":0,"data":[{"alias":"lark","login_url":"https://auth.example/qr","token":"t"}]}"#,
+        ),
+        ("/api/lookup", r#"{"code":0,"data":{"mfa":false,"auth":["email"]}}"#),
+        ("/api/login/code/send", r#"{"code":0,"data":{}}"#),
+    ];
+
+    // the email code login alone
+    const EMAIL_LOGIN_ROUTES: &[(&str, &str)] = &[
+        (
+            "/api/login/setting",
+            r#"{"code":0,"data":{"login_enable_ldap":false,"login_enable":true,"login_orders":["feilian"]}}"#,
+        ),
+        ("/api/tpslogin/link", r#"{"code":0,"data":[]}"#),
+        ("/api/lookup", r#"{"code":0,"data":{"mfa":false,"auth":["email"]}}"#),
+        ("/api/login/code/send", r#"{"code":0,"data":{}}"#),
+    ];
+
+    fn login_client(server: &str, ui: crate::ui::LoginUi) -> Client {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "server": server,
+            "interface_name": format!("corplink-login-test-{unique}"),
+        }))
+        .unwrap();
+        conf.conf_file = Some(
+            std::env::temp_dir()
+                .join(format!("corplink-login-test-{unique}.json"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        Client::new(conf, ui).unwrap()
+    }
+
+    fn prompt_error(err: &anyhow::Error) -> Option<&crate::ui::PromptError> {
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<crate::ui::PromptError>())
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_login_fails_with_no_ui_and_mails_no_code() {
+        for routes in [LOGIN_ROUTES, EMAIL_LOGIN_ROUTES] {
+            let (server, paths) = start_api_server(routes).await;
+            let bridge = Arc::new(crate::ui::LoginBridge::new());
+            let mut client = login_client(&server, crate::ui::LoginUi::ipc(bridge));
+
+            let err = client.login().await.unwrap_err();
+            // not swallowed into "no available login method": the supervisor
+            // decides on this to wait for a login instead of retrying
+            assert_eq!(prompt_error(&err), Some(&crate::ui::PromptError::NoUi));
+            assert!(!paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path == "/api/login/code/send"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_login_stops_instead_of_trying_the_next_method() {
+        let (server, paths) = start_api_server(LOGIN_ROUTES).await;
+        let bridge = Arc::new(crate::ui::LoginBridge::new());
+        bridge.gui_attach();
+        let mut client = login_client(&server, crate::ui::LoginUi::ipc(bridge.clone()));
+        let mut prompts = bridge.subscribe_prompts();
+        let login = tokio::spawn(async move { client.login().await });
+
+        timeout(Duration::from_secs(5), prompts.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            *prompts.borrow(),
+            Some(corplink_ipc::LoginPrompt::Qr { .. })
+        ));
+        assert!(bridge.cancel());
+
+        let err = timeout(Duration::from_secs(5), login)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(prompt_error(&err), Some(&crate::ui::PromptError::Cancelled));
+        assert!(!paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/api/login/code/send"));
     }
 }
