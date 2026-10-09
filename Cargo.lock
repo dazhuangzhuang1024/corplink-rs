@@ -1004,6 +1004,7 @@ dependencies = [
  "eframe",
  "egui",
  "qrcode",
+ "serde_json",
  "tray-icon",
 ]
 

@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -259,6 +259,77 @@ impl Config {
     }
 }
 
+/// `~/.config/corplink-rs/config.json` of the user corplink-rs runs for. Under
+/// sudo, by hand or when corplink-rs re-runs itself with sudo to get root,
+/// that is the user who ran sudo, whatever sudo made of `HOME`.
+pub fn default_config_path() -> Result<PathBuf> {
+    let home = invoking_user_home().context(
+        "cannot tell the home directory of the user running corplink-rs; pass a config path",
+    )?;
+    Ok(corplink_ipc::default_config_file(&home))
+}
+
+#[cfg(unix)]
+fn invoking_user_home() -> Option<PathBuf> {
+    // SAFETY: geteuid cannot fail
+    let euid = unsafe { libc::geteuid() };
+    let sudo_uid = std::env::var("SUDO_UID").ok();
+    choose_home(euid, sudo_uid.as_deref(), std::env::var_os("HOME"), home_of_uid)
+}
+
+#[cfg(not(unix))]
+fn invoking_user_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The home of the user corplink-rs runs for: the caller's when root runs it
+/// through sudo (many sudo setups point `HOME` at root's home), else `HOME`,
+/// else the passwd entry of `euid`.
+#[cfg(unix)]
+fn choose_home(
+    euid: u32,
+    sudo_uid: Option<&str>,
+    home: Option<OsString>,
+    home_of: impl Fn(u32) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if euid == 0 {
+        if let Some(uid) = sudo_uid
+            .and_then(|uid| uid.parse::<u32>().ok())
+            .filter(|&uid| uid != 0)
+        {
+            // never root's config in place of the caller's
+            return home_of(uid);
+        }
+    }
+    home.filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_of(euid))
+}
+
+/// The home directory in the passwd entry of `uid`.
+#[cfg(unix)]
+fn home_of_uid(uid: u32) -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero passwd is a valid out-parameter
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: both buffers outlive the call, and their sizes are passed along
+    let rc = unsafe {
+        libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found)
+    };
+    if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: on success pw_dir is a NUL-terminated string inside buf
+    let dir = OsStr::from_bytes(unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes());
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
 // writes `tmp` next to `path` and renames it over `path`
 async fn replace_file(
     path: &Path,
@@ -315,6 +386,53 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::Config;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_default_config_belongs_to_the_user_behind_sudo() {
+        use super::choose_home;
+        use std::path::PathBuf;
+
+        let passwd = |uid: u32| match uid {
+            0 => Some(PathBuf::from("/var/root")),
+            501 => Some(PathBuf::from("/Users/someone")),
+            _ => None,
+        };
+        let home = |path: &str| Some(std::ffi::OsString::from(path));
+
+        // a plain run: HOME, falling back to the passwd entry
+        assert_eq!(
+            choose_home(501, None, home("/Users/someone"), passwd),
+            Some(PathBuf::from("/Users/someone"))
+        );
+        assert_eq!(choose_home(501, None, None, passwd), Some(PathBuf::from("/Users/someone")));
+        assert_eq!(choose_home(501, None, home(""), passwd), Some(PathBuf::from("/Users/someone")));
+        // root through sudo: the caller's home, whatever sudo did to HOME
+        assert_eq!(
+            choose_home(0, Some("501"), home("/root"), passwd),
+            Some(PathBuf::from("/Users/someone"))
+        );
+        // a caller without a passwd entry: no guess at root's config
+        assert_eq!(choose_home(0, Some("777"), home("/root"), passwd), None);
+        // plain root, or nonsense in SUDO_UID: root's own home
+        assert_eq!(
+            choose_home(0, Some("0"), home("/var/root"), passwd),
+            Some(PathBuf::from("/var/root"))
+        );
+        assert_eq!(
+            choose_home(0, Some("x"), home("/var/root"), passwd),
+            Some(PathBuf::from("/var/root"))
+        );
+        assert_eq!(choose_home(0, None, None, passwd), Some(PathBuf::from("/var/root")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_passwd_entry_of_the_current_user_is_found() {
+        // SAFETY: geteuid cannot fail
+        let euid = unsafe { libc::geteuid() };
+        assert!(super::home_of_uid(euid).is_some_and(|home| home.is_absolute()));
+    }
 
     fn minimal_config() -> Config {
         serde_json::from_str(r#"{"company_name":"test","username":"test"}"#).unwrap()
@@ -500,4 +618,7 @@ pub struct WgConf {
     pub protocol: i32,
     // which server this conf came from, for status display (not wg config)
     pub server_name: String,
+    // the split DNS domains the server suggests, as it sends them (`*.`
+    // wildcards included), for the GUI to offer importing (not wg config)
+    pub server_split_dns: Vec<String>,
 }

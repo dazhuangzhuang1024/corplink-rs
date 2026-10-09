@@ -9,6 +9,10 @@ mod app;
 #[cfg(target_os = "macos")]
 mod ipc_client;
 #[cfg(target_os = "macos")]
+mod service;
+#[cfg(target_os = "macos")]
+mod setup;
+#[cfg(target_os = "macos")]
 mod state;
 #[cfg(target_os = "macos")]
 mod tray;

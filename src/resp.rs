@@ -69,12 +69,25 @@ pub struct RespVpnInfo {
     pub ip: String,
     // 1 for tcp, 2 for udp, we only support udp for now
     pub protocol_mode: i32,
-    // useless
+    // the localized name; some companies fill in only this one
     pub name: String,
     pub en_name: String,
     pub icon: String,
     pub id: i32,
     pub timeout: i32,
+}
+
+impl RespVpnInfo {
+    /// The server's name for logs and the GUI: the English name, else the
+    /// localized one, which some companies leave as the only one. Either
+    /// selects the server (`vpn_server_name`, the GUI's server menu).
+    pub fn display_name(&self) -> &str {
+        if self.en_name.is_empty() {
+            &self.name
+        } else {
+            &self.en_name
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Debug)]

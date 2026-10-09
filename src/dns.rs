@@ -383,19 +383,10 @@ mod resolver {
     /// Trim, lowercase and drop one trailing dot, then require a plain DNS
     /// name. It becomes a file name under /etc/resolver and the daemon runs as
     /// root, so only non-empty labels of ascii letters, digits and hyphens are
-    /// accepted: no path separators, no `.`/`..`, no traversal.
+    /// accepted: no path separators, no `.`/`..`, no traversal. The rule
+    /// lives in the ipc crate, where the GUI checks its input with it too.
     pub(super) fn normalize_domain(domain: &str) -> Option<String> {
-        let domain = domain.trim().to_ascii_lowercase();
-        let domain = domain.strip_suffix('.').unwrap_or(&domain);
-        let valid = domain.len() <= 253
-            && domain.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            });
-        valid.then(|| domain.to_string())
+        corplink_ipc::normalize_domain(domain)
     }
 
     // never follow a symlink planted at the target, the daemon runs as root;

@@ -59,8 +59,10 @@ cargo build --release
 > **该程序需要 root 权限来启动 `wg-go` (windows 上需要管理员权限)**
 
 ```bash
-# direct
-corplink-rs config.json
+# direct: reads ~/.config/corplink-rs/config.json
+corplink-rs
+# or any other config file
+corplink-rs /path/to/config.json   # same as: corplink-rs --config /path/to/config.json
 # systemd
 # config is /etc/corplink/config.json
 systemctl start corplink-rs.service
@@ -71,6 +73,14 @@ systemctl enable corplink-rs.service
 # config is /etc/corplink/test.json
 # NOTE: cookies.json is reserved by cookie storage
 systemctl start corplink-rs@test.service
+```
+
+不带参数时读取 `~/.config/corplink-rs/config.json`；用 `sudo` 运行时（包括程序自己通过 sudo 提权重新运行）用的是执行 sudo 的那个用户的目录，而不是 root 的。cookie 保存在配置文件所在目录（`<interface_name>_cookies.json`），所以默认情况下全部状态都在 `~/.config/corplink-rs/` 里。首次使用：
+
+```bash
+mkdir -p ~/.config/corplink-rs && chmod 700 ~/.config/corplink-rs
+cp config/config.json ~/.config/corplink-rs/ && chmod 600 ~/.config/corplink-rs/config.json
+# 然后编辑 ~/.config/corplink-rs/config.json，见下方配置文件实例
 ```
 
 ## windows 使用说明
@@ -122,26 +132,40 @@ $env:RUST_LOG="debug"; .\corplink-rs.exe config.json
 macos 要求 tun 设备的名称满足正则表达式 `utun[0-9]*` ，因此需要将配置文件中的 `interface_name` 改为符合正则的名字，例如 `utun12345`  
 另外， `utun` 后的数字类型应该是 `int16` ，如果大于 `32767` 会报错 `Failed to create TUN device: invalid argument` 。具体参考 [#46](https://github.com/PinkD/corplink-rs/issues/46)
 
-### macOS 后台服务（launchd）
+### macOS：用 App 安装（不需要命令行）
 
-首次安装时需要注意，LaunchDaemon 没有交互终端。如果 `config.json` 中的认证信息可以自动完成登录，可以直接安装；如果首次登录需要扫码或输入验证码，应先在前台完成登录，看到 VPN 已连接后按 `Ctrl+C` 退出：
+1. 打开 `corplink-gui-<version>.dmg`，把 Corplink GUI 拖进「应用程序」。
+2. 从「应用程序」打开它。App 没有 Apple 开发者证书签名，第一次打开会被拦下：到「系统设置 → 隐私与安全性」点「仍要打开」。
+3. 自动弹出「首次设置」：填写企业代码、用户名，按需填写密码、选择登录方式，点「验证并安装」，再在系统弹窗里输入管理员密码。
+4. 需要扫码或输入验证码时会弹出登录窗口；连上后菜单栏图标变绿。
+
+App 内置了守护进程和下文的安装脚本：配置写在 `~/.config/corplink-rs/config.json`，和命令行方式默认的是同一个文件；装的也是同一个 launchd 服务，两种方式可以混用，命令行装的服务 App 能直接管理，App 装的也能用脚本重装或卸载。之后的「设置」（账号、固定节点、分流域名）「重新安装服务」「卸载服务」「登录时启动 GUI」都在菜单的「服务」里；保存设置不需要管理员密码，服务会自动重启并读取新配置。设置里会逐条列出服务端下发的分流域名，标明哪些已在列表、哪些已被上级域名覆盖、哪些不能用，勾选后导入：`*.example.com` 这样的通配按 `example.com` 处理（macOS 的 resolver 文件本身就覆盖所有子域名），导入后保存才生效。路由等其他高级选项直接编辑配置文件。
+
+构建 DMG（App 只支持构建它的那台 Mac 的架构，在 Apple Silicon 上构建就只能在 Apple Silicon 上用）：
+
+```bash
+./scripts/build-gui-dmg.sh   # 产物在 dist/corplink-gui-<version>.dmg
+```
+
+### macOS 后台服务（launchd，命令行安装）
+
+LaunchDaemon 没有交互终端。如果配置中的认证信息可以自动完成登录，可以直接安装；如果首次登录需要扫码或输入验证码，可以装好后在菜单栏 GUI 里完成登录，或者先在前台完成登录，看到 VPN 已连接后按 `Ctrl+C` 退出：
 
 ```bash
 ./libwg/build.sh
 cargo build --release
 
-# 仅在首次登录需要交互时执行
-sudo ./target/release/corplink-rs "$PWD/config.json"
+# 仅在首次登录需要交互、又不用 GUI 时执行
+sudo ./target/release/corplink-rs
 ```
 
-如果每次连接都要输入 2FA 验证码（服务端没有下发 TOTP 密钥，`config.json` 里没有 `code`），后台服务无法自动连接。
+如果每次连接都要输入 2FA 验证码（服务端没有下发 TOTP 密钥，配置里没有 `code`），后台服务只能靠 GUI 在每次连接时输入。
 
-然后安装并立即启动后台服务：
+然后安装并立即启动后台服务（不传 `--config` 时使用执行 sudo 的用户的 `~/.config/corplink-rs/config.json`）：
 
 ```bash
 sudo ./scripts/install-launchd.sh \
   --binary "$PWD/target/release/corplink-rs" \
-  --config "$PWD/config.json" \
   --vpn-server Node03 \
   --log-filter corplink_rs=debug
 ```
@@ -159,7 +183,7 @@ plist 设置了 `RunAtLoad`，因此以后开机时会自动启动。已经安�
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist
 ```
 
-脚本不会复制或修改 `config.json`，只把它的绝对路径传给程序，cookie 保存在配置文件所在目录，因此安装后不要移动配置文件。配置文件不要放在 `~/Desktop`、`~/Documents`、`~/Downloads`、iCloud、`~/Library/CloudStorage` 或外接卷上，LaunchDaemon 没有完全磁盘访问权限时读不到这些位置。
+脚本不会复制或修改配置文件，只把它的绝对路径传给程序，cookie 保存在配置文件所在目录，因此安装后不要移动配置文件。之前用仓库目录里 `config.json` 安装的服务照常工作；想换到默认目录，把 `config.json` 和 `<interface_name>_cookies.json` 移到 `~/.config/corplink-rs/` 后执行 `sudo ./scripts/install-launchd.sh --config ~/.config/corplink-rs/config.json`。配置文件不要放在 `~/Desktop`、`~/Documents`、`~/Downloads`、iCloud、`~/Library/CloudStorage` 或外接卷上，LaunchDaemon 没有完全磁盘访问权限时读不到这些位置。
 
 服务以 root 身份读取配置和保存 cookie，应限制这些文件的读取权限，并且只允许可信管理员修改配置目录。程序拒绝使用符号链接形式的配置文件，也不会通过符号链接回写 cookie。
 
@@ -172,7 +196,7 @@ cargo build --release
 sudo ./scripts/install-launchd.sh
 ```
 
-登录态失效后（日志中出现 `needs input, but stdin is not usable` 并提示重新登录），服务无法自己重新扫码或输入验证码，需要先停止服务，用服务所用的配置文件在前台重新登录，再启动服务：
+登录态失效后，服务进入「需要登录」状态等待，用菜单栏 GUI 的登录窗口完成扫码或验证码即可。不用 GUI 时（日志中出现 `no interactive UI available`），需要先停止服务，用服务所用的配置文件在前台重新登录，再启动服务：
 
 ```bash
 plist=/Library/LaunchDaemons/com.github.pinkd.corplink-rs.plist
@@ -203,17 +227,11 @@ LaunchDaemon 本身以 root 身份运行，plist 的 `ProgramArguments` 中不�
 
 ### macOS 菜单栏图形界面（corplink-gui）
 
-守护进程自带一个菜单栏控制器（类似 ClashX 的形态）：状态栏常驻图标按连接状态变色（灰=未连接、橙=连接中、绿=已连接、红=需要登录），点开菜单可以连接/断开/重连、按延迟切换节点、弹出登录窗口（扫码/验证码，不再需要停服务进终端）、查看实时日志。安装/卸载守护进程仍走上面的脚本，GUI 只是遥控器：退出 GUI 不影响 VPN。
+菜单栏控制器（类似 ClashX 的形态）：状态栏常驻一个白色挂锁图标，锁体按连接状态填充颜色（空心=未连接或服务未安装、橙=连接中、绿=已连接、红=需要登录），点开菜单可以连接/断开/重连、按延迟切换节点、弹出登录窗口（扫码/验证码，不再需要停服务进终端）、查看实时日志，「服务」子菜单管理安装和账号（见上文「用 App 安装」）。退出 GUI 不影响 VPN。
 
 GUI 通过 `/var/run/corplink-rs.sock`（可用 `CORPLINK_IPC_SOCK` 覆盖）与守护进程通信，连接只接受 root 和配置文件属主，多用户机器上其他用户无法操控或读取日志。
 
-构建 DMG（ad-hoc 签名，本机可直接用；传给别人首次打开需要"系统设置 → 隐私与安全性 → 仍要打开"）：
-
-```bash
-./scripts/build-gui-dmg.sh   # 产物在 dist/corplink-gui-<version>.dmg
-```
-
-只构建二进制（调试用，不经 .app 启动会在 Dock 出现图标）：`cargo build -p corplink-gui`。
+只构建二进制（调试用，不经 .app 启动会在 Dock 出现图标，也没有内置服务可装）：`cargo build -p corplink-gui`。
 
 0.6.0 起守护进程是常驻进程：GUI 连接过一次后，断开 VPN 只回到 Idle 而不退出进程（launchd 的 KeepAlive 不会拉起干净退出的进程）；握手超时在进程内直接重连，跳过 launchd 的重启节流；连接失败按 10s 起翻倍的间隔自动重试 5 次，仍失败则停在 Idle，等你从菜单重新连接。登录态过期、需要扫码或输入验证码时进入"需要登录"状态安静等待 GUI，而不是每 60 秒重启一次（邮箱验证码登录也不会在没人能输入时先发出验证码）；登录提示 10 分钟无人应答同样回到"需要登录"，不会自动重试。从未有 GUI 连接过时，其余行为与旧版一致：连接失败或握手超时都会退出交给 launchd 拉起。
 
@@ -228,6 +246,8 @@ RUST_LOG=debug ./corplink-rs config.json
 ```
 
 # 配置文件实例
+
+配置文件默认是 `~/.config/corplink-rs/config.json`。JSON 不支持注释，下方完整配置里的注释需要删掉。
 
 最小配置
 

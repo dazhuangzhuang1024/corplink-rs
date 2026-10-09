@@ -49,6 +49,11 @@ pub enum Command {
     Servers {
         reply: oneshot::Sender<Result<Vec<VpnServer>, String>>,
     },
+    /// Stop the session and exit, for launchd to start the daemon again with
+    /// the config file as it is now.
+    Restart {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Everything the connection handlers need, shared with the supervisor.
@@ -315,6 +320,11 @@ async fn handle_request(
                 Some(RespData::Servers { servers })
             })
             .await?
+        }
+        ToDaemon::Restart { id } => {
+            let (tx, rx) = oneshot::channel();
+            let cmd = Command::Restart { reply: tx };
+            forward(wr, id, shared, cmd, rx, replies, |()| None).await?
         }
     }
     Ok(())
@@ -723,6 +733,20 @@ mod tests {
                 ..
             } => assert_eq!(servers.len(), 1),
             other => panic!("expected a servers reply, got {other:?}"),
+        }
+
+        gui.send(&ToDaemon::Restart { id: 13 }).await;
+        match daemon.cmd_rx.recv().await.unwrap() {
+            Command::Restart { reply } => {
+                reply.send(Err("not started by launchd".into())).unwrap();
+            }
+            other => panic!("expected a restart command, got {other:?}"),
+        }
+        match gui.recv_reply(13).await {
+            FromDaemon::Reply { ok: false, error, .. } => {
+                assert_eq!(error.unwrap(), "not started by launchd")
+            }
+            other => panic!("expected an error reply, got {other:?}"),
         }
     }
 

@@ -26,3 +26,4 @@ libwg/libwg.h
 *.zip
 dist/
 .zcode/
+.DS_Store

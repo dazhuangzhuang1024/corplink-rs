@@ -1,15 +1,21 @@
 //! The egui app: hidden by default, shown for the login and log windows.
 
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use corplink_ipc::{LoginPrompt, ToDaemon};
 use eframe::egui;
 use eframe::egui::{ColorImage, TextureHandle, TextureOptions};
 
 use crate::ipc_client::{AppEvent, Outbound};
-use crate::state::{next_id, GuiState, Link};
+use crate::service::{self, Bundle};
+use crate::setup::ServicePanel;
+use crate::state::{next_id, GuiState, Link, ServiceStatus};
 use crate::tray;
+
+/// How often the installation is looked at while no daemon answers, to
+/// notice one installed or removed from the command line.
+const SERVICE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct CorplinkApp {
     state: GuiState,
@@ -24,6 +30,10 @@ pub struct CorplinkApp {
     viewport_visible: bool,
     // set by the quit item: the close it requests must not be cancelled
     quitting: bool,
+    // the daemon and scripts this app carries; None for a bare `cargo run`
+    bundle: Option<Bundle>,
+    panel: ServicePanel,
+    last_service_check: Instant,
     // the login QR, rebuilt whenever its url changes
     qr_url: Option<String>,
     qr_texture: Option<TextureHandle>,
@@ -37,7 +47,18 @@ impl CorplinkApp {
         outbound: std::sync::mpsc::Sender<Outbound>,
     ) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
-        let state = GuiState::default();
+        let bundle = Bundle::current();
+        let mut state = GuiState::default();
+        refresh_service(&mut state, bundle.as_ref());
+        if let Some(bundle) = &bundle {
+            // the app may have moved since the login item was made
+            service::refresh_login_item(&bundle.app);
+        }
+        let mut panel = ServicePanel::new();
+        if !state.service.installed {
+            // first run: straight to the setup
+            panel.open(&mut state);
+        }
         let tray = tray::Tray::new(&state);
         CorplinkApp {
             built_revision: state.revision,
@@ -48,6 +69,9 @@ impl CorplinkApp {
             tray,
             viewport_visible: true,
             quitting: false,
+            bundle,
+            panel,
+            last_service_check: Instant::now(),
             qr_url: None,
             qr_texture: None,
         }
@@ -71,8 +95,12 @@ impl CorplinkApp {
                     for msg in follow {
                         self.send(msg);
                     }
+                    refresh_service(&mut self.state, self.bundle.as_ref());
                 }
-                AppEvent::Disconnected => self.state.on_disconnected(),
+                AppEvent::Disconnected => {
+                    self.state.on_disconnected();
+                    refresh_service(&mut self.state, self.bundle.as_ref());
+                }
                 AppEvent::Frame(frame) => {
                     for msg in self.state.apply(&frame) {
                         self.send(msg);
@@ -113,6 +141,32 @@ impl CorplinkApp {
                     }
                 }
                 ids::LOGS => self.state.toggle_logs(),
+                ids::SERVICE_SETUP => self.panel.open(&mut self.state),
+                ids::SERVICE_REINSTALL => {
+                    if let Some(bundle) = self.bundle.clone() {
+                        self.panel.start_reinstall(&mut self.state, bundle);
+                    }
+                }
+                ids::SERVICE_UNINSTALL => {
+                    if let Some(bundle) = self.bundle.clone() {
+                        self.panel.start_uninstall(&mut self.state, bundle);
+                    }
+                }
+                ids::SERVICE_LOGIN_ITEM => {
+                    if let Some(bundle) = &self.bundle {
+                        let enable = !self.state.login_item;
+                        if let Err(e) = service::set_login_item(&bundle.app, enable) {
+                            eprintln!("[gui] failed to change the login item: {e}");
+                        }
+                        self.state.login_item = service::login_item_enabled();
+                        self.state.touch();
+                    }
+                }
+                ids::SERVICE_REVEAL => {
+                    if let Some(config) = &self.state.service.config {
+                        service::reveal_in_finder(config);
+                    }
+                }
                 ids::QUIT => {
                     self.quitting = true;
                     let _ = self.outbound.send(Outbound::Quit);
@@ -242,6 +296,13 @@ impl eframe::App for CorplinkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events();
         self.pump_menu(ctx);
+        if self.panel.poll(&mut self.state, self.bundle.as_ref(), &self.outbound)
+            || (self.state.link == Link::Disconnected
+                && self.last_service_check.elapsed() >= SERVICE_CHECK_INTERVAL)
+        {
+            self.last_service_check = Instant::now();
+            refresh_service(&mut self.state, self.bundle.as_ref());
+        }
         // the window's close button only hides it: the app lives in the menu
         // bar, and letting the root viewport close would quit it
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
@@ -250,7 +311,7 @@ impl eframe::App for CorplinkApp {
         }
         self.sync_tray();
 
-        let any_window = self.state.show_login || self.state.show_logs;
+        let any_window = self.state.show_login || self.state.show_logs || self.state.show_service;
         if any_window != self.viewport_visible {
             self.viewport_visible = any_window;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(any_window));
@@ -277,6 +338,12 @@ impl eframe::App for CorplinkApp {
                         ui.separator();
                         ui.add_space(10.0);
                     }
+                    if self.state.show_service {
+                        self.panel.ui(ui, &mut self.state, self.bundle.as_ref());
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                    }
                     if self.state.show_logs {
                         self.log_panel(ui);
                     }
@@ -284,6 +351,26 @@ impl eframe::App for CorplinkApp {
         });
         // keep polling while windows are up
         ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+/// Looks at the installation again: the launchd job, its config file, and
+/// whether the GUI starts at login.
+fn refresh_service(state: &mut GuiState, bundle: Option<&Bundle>) {
+    let installed = service::installed_service();
+    let status = ServiceStatus {
+        installed: installed.is_some(),
+        config: match installed {
+            Some(config) => config,
+            None => service::default_config_path(),
+        },
+        bundled: bundle.is_some(),
+    };
+    let login_item = service::login_item_enabled();
+    if status != state.service || login_item != state.login_item {
+        state.service = status;
+        state.login_item = login_item;
+        state.touch();
     }
 }
 

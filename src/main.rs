@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use corplink_ipc::{RunState, Status, VpnServer};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -34,40 +34,53 @@ use config::{Config, WgConf};
 use ipc_server::{Command, DaemonShared};
 use ui::{LoginBridge, LoginUi, PromptError};
 
-fn print_usage_and_exit(name: &str, conf: &str) {
-    println!("usage:\n\t{} {}", name, conf);
-    exit(1);
+fn print_usage_and_exit(name: &str) -> ! {
+    println!(
+        "usage:\n\t{name} [[--config] config.json]\n\n\
+         without a config path, ~/.config/corplink-rs/config.json is used"
+    );
+    exit(1)
 }
 
-fn parse_arg() -> String {
-    let mut conf_file = String::from("config.json");
-    let mut args = env::args();
-    // pop name
-    let name = args.next().unwrap();
-    match args.len() {
-        0 => {}
-        1 => {
-            // pop arg
-            let arg = args.next().unwrap();
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage_and_exit(&name, &conf_file);
-                }
-                _ => {
-                    conf_file = arg;
-                }
-            }
-        }
-        _ => {
-            print_usage_and_exit(&name, &conf_file);
-        }
+/// The config path from the command line: `corplink-rs [[--config] PATH]`;
+/// `Ok(None)` means none was given. `Err` asks for the usage text.
+fn parse_args(args: &[String]) -> Result<Option<String>, ()> {
+    match args {
+        [] => Ok(None),
+        [flag] if flag == "-h" || flag == "--help" || flag == "--config" => Err(()),
+        [flag, path] if flag == "--config" => Ok(Some(path.clone())),
+        [path] => Ok(Some(path.clone())),
+        _ => Err(()),
     }
-    conf_file
+}
+
+fn parse_arg() -> Result<String> {
+    let args: Vec<String> = env::args().collect();
+    let Ok(config) = parse_args(&args[1..]) else {
+        print_usage_and_exit(&args[0]);
+    };
+    if let Some(config) = config {
+        return Ok(config);
+    }
+    let path = config::default_config_path()?;
+    if !path.exists() {
+        bail!(
+            "no config file at {}: create it (config/config.json in the source tree is an \
+             example) or pass a config path",
+            path.display()
+        );
+    }
+    path.into_os_string()
+        .into_string()
+        .map_err(|path| anyhow!("the config path {path:?} is not valid UTF-8; pass a config path"))
 }
 
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
+/// The exit code of a restart asked for over IPC: any failure makes launchd
+/// (KeepAlive with SuccessfulExit = false) start the daemon again. EX_TEMPFAIL.
+const EX_RESTART: i32 = 75;
 
 #[tokio::main]
 async fn main() {
@@ -84,7 +97,7 @@ async fn run() -> Result<()> {
 
     print_version();
 
-    let conf_file = parse_arg();
+    let conf_file = parse_arg()?;
     let mut conf = Config::from_file(&conf_file)
         .await
         .context("failed to load config")?;
@@ -336,6 +349,21 @@ fn remove_socket(ipc_path: &Option<PathBuf>) {
     }
 }
 
+/// Whether launchd started this process, so that exiting restarts it. A
+/// foreground run whose terminal went away is adopted by launchd too, but
+/// nothing starts that one again; it is not worth telling apart.
+fn run_by_launchd() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getppid cannot fail
+        unsafe { libc::getppid() == 1 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// The long-lived session loop. Without a GUI ever connected it behaves like
 /// the old straight-line daemon: auto-connect, exit non-zero on failure so
 /// launchd restarts us, exit ETIMEDOUT when the handshake dies. Once a GUI has
@@ -383,6 +411,7 @@ async fn supervise(
             status.dns = Some(session.wg_conf.dns.clone());
             status.protocol =
                 Some(if session.wg_conf.protocol == 1 { "tcp" } else { "udp" }.to_string());
+            status.server_split_dns_domains = session.wg_conf.server_split_dns.clone();
         }
         shared.update_status(status);
     };
@@ -457,6 +486,32 @@ async fn supervise(
                         // reads the config from disk and never writes there.
                         let conf_file = conf_file.clone();
                         tokio::spawn(probe_servers(conf_file, reply));
+                    }
+                    Command::Restart { reply } => {
+                        if !run_by_launchd() {
+                            let _ = reply.send(Err(
+                                "corplink-rs was not started by launchd, which would start it \
+                                 again; restart it yourself"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        log::info!("restarting to read the config again");
+                        stop_all(&mut connect_task, &mut watchdog, &mut active, &bridge, &params, &client)
+                            .await;
+                        // the session is gone: say so, and take no new
+                        // connections on the way out
+                        publish(
+                            Phase::Connecting,
+                            None,
+                            Some("restarting to read the config again".to_string()),
+                        );
+                        remove_socket(&ipc_path);
+                        let _ = reply.send(Ok(()));
+                        // the reply goes out from the connection's own task
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        log::info!("reach exit");
+                        exit(EX_RESTART);
                     }
                 }
             }
@@ -877,4 +932,35 @@ fn print_version() {
     let pkg_name = env!("CARGO_PKG_NAME");
     let pkg_version = env!("CARGO_PKG_VERSION");
     log::info!("running {}@{}", pkg_name, pkg_version);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn the_config_path_comes_alone_or_after_config() {
+        assert_eq!(parse_args(&args(&[])), Ok(None));
+        assert_eq!(
+            parse_args(&args(&["/etc/corplink/config.json"])),
+            Ok(Some("/etc/corplink/config.json".to_string()))
+        );
+        assert_eq!(
+            parse_args(&args(&["--config", "a.json"])),
+            Ok(Some("a.json".to_string()))
+        );
+        for bad in [
+            &["-h"][..],
+            &["--help"],
+            &["--config"],
+            &["a.json", "b.json"],
+            &["--config", "a.json", "b.json"],
+        ] {
+            assert_eq!(parse_args(&args(bad)), Err(()), "{bad:?}");
+        }
+    }
 }

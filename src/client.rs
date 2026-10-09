@@ -490,8 +490,8 @@ impl Client {
             std::iter::repeat_with(|| None).take(probes.len()).collect();
         while let Some((index, vpn, latency)) = probes.next().await {
             match latency {
-                Some(ms) => log::info!("server name {}, latency {}ms", vpn.en_name, ms),
-                None => log::warn!("no probe answer from {}", vpn.en_name),
+                Some(ms) => log::info!("server name {}, latency {}ms", vpn.display_name(), ms),
+                None => log::warn!("no probe answer from {}", vpn.display_name()),
             }
             out[index] = Some((vpn, latency));
         }
@@ -922,7 +922,7 @@ impl Client {
                 Ok(response) => {
                     log::info!(
                         "server name {}, latency {}ms",
-                        vpn.en_name,
+                        vpn.display_name(),
                         response.latency_ms
                     );
                     let should_replace = match &fastest {
@@ -978,7 +978,7 @@ impl Client {
                     Ok(response) => {
                         log::info!(
                             "server name {}, latency {}ms",
-                            vpn.en_name,
+                            vpn.display_name(),
                             response.latency_ms
                         );
                         return Some(SelectedVpn {
@@ -1169,7 +1169,7 @@ impl Client {
             vpn_info.len(),
             vpn_info
                 .iter()
-                .map(|i| i.en_name.clone())
+                .map(|i| i.display_name().to_string())
                 .collect::<Vec<String>>()
         );
         if let Some(name) = self.conf.effective_vpn_server_name() {
@@ -1211,7 +1211,7 @@ impl Client {
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
-                            vpn.en_name,
+                            vpn.display_name(),
                             mode
                         );
                         false
@@ -1243,7 +1243,7 @@ impl Client {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
             Err(_) => format!("{}:{}", vpn.ip, vpn.vpn_port),
         };
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        log::info!("try connect to {}, address {}", vpn.display_name(), vpn_addr);
 
         let key = self
             .conf
@@ -1256,7 +1256,13 @@ impl Client {
         let mtu = wg_info.setting.vpn_mtu;
         // informational: the configured split_dns_domains stays the source of
         // truth for which /etc/resolver files get written, but the server list
-        // helps verify it covers everything it should
+        // helps verify it covers everything it should, and the GUI offers to
+        // import it
+        let server_split_dns = wg_info
+            .setting
+            .vpn_dns_domain_split
+            .clone()
+            .unwrap_or_default();
         if let Some(domains) = &wg_info.setting.vpn_dns_domain_split {
             if self
                 .conf
@@ -1443,7 +1449,8 @@ impl Client {
             allowed_ips,
             routes,
             dns,
-            server_name: vpn.en_name.clone(),
+            server_name: vpn.display_name().to_string(),
+            server_split_dns,
             // `force_protocol`, when set, overrides the server-advertised `protocol_mode`
             protocol: match self.conf.force_protocol.as_deref() {
                 Some(p) if p.eq_ignore_ascii_case("udp") => 0,
@@ -1630,6 +1637,18 @@ mod tests {
             id: 0,
             timeout: 0,
         }
+    }
+
+    #[test]
+    fn servers_without_an_english_name_go_by_their_name() {
+        let mut vpn = vpn_info(443, "node-en");
+        vpn.name = "节点一".to_string();
+        assert_eq!(vpn.display_name(), "node-en");
+        // some companies fill in only the localized name
+        vpn.en_name.clear();
+        assert_eq!(vpn.display_name(), "节点一");
+        // what the GUI shows is what selects the server
+        assert!(matches_vpn_server_name(&vpn, Some(vpn.display_name())));
     }
 
     #[test]

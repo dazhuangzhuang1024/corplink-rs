@@ -20,7 +20,8 @@ if [[ -x "${REPO_ROOT}/target/release/corplink-rs" ]]; then
 else
     source_binary_path="${REPO_ROOT}/corplink-rs"
 fi
-config_path="${REPO_ROOT}/config.json"
+# empty: the installed one, else the default of the user running sudo
+config_path=""
 vpn_server_name=""
 rust_log="corplink_rs=info"
 # options not given again on a reinstall keep their installed values
@@ -35,8 +36,9 @@ Usage: sudo $0 [options]
 Options:
   --binary PATH       source corplink-rs executable
                       (default: ${source_binary_path})
-  --config PATH       config file passed to corplink-rs
-                      (default: the installed one, else ${config_path})
+  --config PATH       config file passed to corplink-rs (default: the
+                      installed one, else ~/.config/corplink-rs/config.json
+                      of the user running sudo)
   --vpn-server NAME   override the configured VPN server name; '' clears it
                       (default: the installed one, else none)
   --log-filter VALUE  RUST_LOG value
@@ -108,6 +110,21 @@ if [[ -f "${INSTALLED_PLIST}" ]]; then
     if [[ "${log_filter_given}" -eq 0 ]] && previous="$(installed_value EnvironmentVariables.RUST_LOG)"; then
         rust_log="${previous}"
     fi
+fi
+if [[ -z "${config_path}" ]]; then
+    # the default config of corplink-rs, of the user who ran sudo (root's own
+    # home would be the wrong one)
+    invoking_home=""
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+        invoking_home="$(/usr/bin/dscl . -read "/Users/${SUDO_USER}" NFSHomeDirectory 2>/dev/null)" || true
+        # "NFSHomeDirectory: /Users/x", or the value on its own line after it
+        invoking_home="${invoking_home#NFSHomeDirectory:}"
+        invoking_home="${invoking_home#"${invoking_home%%[![:space:]]*}"}"
+    fi
+    [[ "${invoking_home}" == /* ]] || \
+        die "cannot tell whose ~/.config/corplink-rs/config.json to use; pass --config PATH"
+    config_path="${invoking_home}/.config/corplink-rs/config.json"
+    config_origin=" (the default; pass --config to use another file)"
 fi
 
 [[ ! -L "${config_path}" ]] || \
@@ -270,6 +287,13 @@ temporary_plist="$(/usr/bin/mktemp -t corplink-rs-launchd-plist)"
 temporary_binary="$(/usr/bin/mktemp -t corplink-rs-launchd-binary)"
 /bin/cp "${TEMPLATE_PATH}" "${temporary_plist}"
 /usr/bin/install -o root -g wheel -m 0755 "${source_binary_path}" "${temporary_binary}"
+# files from a download (the GUI's DMG) carry the quarantine flag, which cp
+# and install copy along: launchd refuses to load a quarantined plist
+# ("Bootstrap failed: 5: Input/output error"), and Gatekeeper would keep it
+# from starting a quarantined binary
+for file in "${temporary_plist}" "${temporary_binary}"; do
+    /usr/bin/xattr -d com.apple.quarantine "${file}" 2>/dev/null || true
+done
 
 /usr/bin/plutil -remove ProgramArguments "${temporary_plist}"
 /usr/bin/plutil -insert ProgramArguments -array "${temporary_plist}"
@@ -294,6 +318,9 @@ lock_acquired=1
 
 # checked before the running service is touched
 binary_directory="$(dirname "${INSTALLED_BINARY}")"
+if [[ ! -d "$(dirname "${binary_directory}")" ]]; then
+    /usr/bin/install -d -o root -g wheel -m 0755 "$(dirname "${binary_directory}")"
+fi
 require_secure_directory "$(dirname "${binary_directory}")"
 if [[ ! -d "${binary_directory}" ]]; then
     /usr/bin/install -d -o root -g wheel -m 0755 "${binary_directory}"

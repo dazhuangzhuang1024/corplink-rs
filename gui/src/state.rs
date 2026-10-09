@@ -2,6 +2,7 @@
 //! event handling, menu labels and tray color are unit-testable.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use corplink_ipc::{FromDaemon, LoginPrompt, RunState, Status, ToDaemon, VpnServer};
 
@@ -25,6 +26,57 @@ pub enum IconKind {
     LoginNeeded,
 }
 
+/// What the GUI knows about the service, without asking root.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServiceStatus {
+    /// whether the launchd job is installed
+    pub installed: bool,
+    /// the config file of the installed service, else the default one a new
+    /// installation gets
+    pub config: Option<PathBuf>,
+    /// whether this app carries a daemon to install (not a bare `cargo run`)
+    pub bundled: bool,
+}
+
+/// Saving the account settings while the daemon runs: it disconnects first,
+/// so it cannot save its old config over the new one while tearing the
+/// session down; then the GUI writes the file, then the daemon restarts to
+/// read it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Reconfig {
+    #[default]
+    Idle,
+    /// waiting for the reply to this disconnect
+    Disconnecting(u64),
+    /// the session is down: the config can be written now
+    WriteDue,
+    /// waiting for the reply to this restart
+    Restarting(u64),
+}
+
+/// The outcome of the last service task, for the service window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notice {
+    pub text: String,
+    pub error: bool,
+}
+
+impl Notice {
+    pub fn info(text: impl Into<String>) -> Notice {
+        Notice {
+            text: text.into(),
+            error: false,
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Notice {
+        Notice {
+            text: text.into(),
+            error: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct GuiState {
     pub link: Link,
@@ -42,6 +94,17 @@ pub struct GuiState {
     /// freshly connected daemon says login_needed, offer to start it right
     /// away instead of waiting for a menu click
     login_nudged: bool,
+    /// the split DNS domains the server suggested in the last session seen,
+    /// kept after it ended, for the settings window to import
+    pub server_split_dns: Vec<String>,
+    pub service: ServiceStatus,
+    pub show_service: bool,
+    /// whether the GUI starts at login
+    pub login_item: bool,
+    /// a service task (install, reinstall, uninstall, saving settings) runs
+    pub service_busy: bool,
+    pub reconfig: Reconfig,
+    pub service_notice: Option<Notice>,
     /// bumped whenever anything the tray shows changed, so the app knows to
     /// rebuild the menu and swap the icon
     pub revision: u64,
@@ -61,13 +124,20 @@ impl Default for GuiState {
             show_login: false,
             code_input: String::new(),
             login_nudged: false,
+            server_split_dns: Vec::new(),
+            service: ServiceStatus::default(),
+            show_service: false,
+            login_item: false,
+            service_busy: false,
+            reconfig: Reconfig::Idle,
+            service_notice: None,
             revision: 0,
         }
     }
 }
 
 impl GuiState {
-    fn touch(&mut self) {
+    pub fn touch(&mut self) {
         self.revision += 1;
     }
 
@@ -86,6 +156,21 @@ impl GuiState {
         self.servers_loading = false;
         self.logs_subscribed = false;
         self.prompt = None;
+        match self.reconfig {
+            // the daemon is gone, so nothing can save over the new config
+            Reconfig::Disconnecting(_) => self.reconfig = Reconfig::WriteDue,
+            // a restart takes the daemon away, the reply may not make it
+            Reconfig::Restarting(_) => self.finish_service_task(Notice::info(RESTARTING)),
+            Reconfig::Idle | Reconfig::WriteDue => {}
+        }
+        self.touch();
+    }
+
+    /// Ends the running service task with what to tell the user.
+    pub fn finish_service_task(&mut self, notice: Notice) {
+        self.reconfig = Reconfig::Idle;
+        self.service_busy = false;
+        self.service_notice = Some(notice);
         self.touch();
     }
 
@@ -112,8 +197,7 @@ impl GuiState {
                 {
                     self.show_login = true;
                 }
-                self.status = status.clone();
-                self.touch();
+                self.set_status(status.clone());
                 return out;
             }
             FromDaemon::LogLine { line } => {
@@ -138,11 +222,30 @@ impl GuiState {
 
     fn apply_reply(
         &mut self,
-        _id: u64,
+        id: u64,
         ok: bool,
         error: Option<String>,
         data: Option<corplink_ipc::RespData>,
     ) {
+        match self.reconfig {
+            // written either way: a refused disconnect (a netstack tunnel
+            // stays up) only leaves the restart's teardown to race the write
+            Reconfig::Disconnecting(want) if want == id => {
+                self.reconfig = Reconfig::WriteDue;
+            }
+            Reconfig::Restarting(want) if want == id => {
+                let notice = if ok {
+                    Notice::info(RESTARTING)
+                } else {
+                    Notice::error(format!(
+                        "配置已保存，但服务没有重启：{}",
+                        error.clone().unwrap_or_default()
+                    ))
+                };
+                self.finish_service_task(notice);
+            }
+            _ => {}
+        }
         if !ok {
             if let Some(error) = error {
                 self.push_log(format!("[gui] {}", error));
@@ -150,10 +253,7 @@ impl GuiState {
             return;
         }
         match data {
-            Some(corplink_ipc::RespData::Status { status }) => {
-                self.status = status;
-                self.touch();
-            }
+            Some(corplink_ipc::RespData::Status { status }) => self.set_status(status),
             Some(corplink_ipc::RespData::Servers { servers }) => {
                 self.servers = servers;
                 self.servers_loading = false;
@@ -170,6 +270,14 @@ impl GuiState {
             }
             None => {}
         }
+    }
+
+    fn set_status(&mut self, status: Status) {
+        if !status.server_split_dns_domains.is_empty() {
+            self.server_split_dns = status.server_split_dns_domains.clone();
+        }
+        self.status = status;
+        self.touch();
     }
 
     fn push_log(&mut self, line: String) {
@@ -219,7 +327,14 @@ impl GuiState {
     pub fn hide_windows(&mut self) {
         self.show_login = false;
         self.show_logs = false;
+        self.show_service = false;
         self.touch();
+    }
+
+    /// Whether the daemon is a different build than this app's: the app's
+    /// daemon should be installed over it.
+    pub fn version_mismatch(&self) -> bool {
+        self.link == Link::Connected && self.status.version != env!("CARGO_PKG_VERSION")
     }
 
     /// The tray color, straight from the model.
@@ -238,6 +353,7 @@ impl GuiState {
     /// One-line status for the menu header.
     pub fn status_line(&self) -> String {
         match self.link {
+            Link::Disconnected if !self.service.installed => "服务未安装".to_string(),
             Link::Disconnected => "守护进程未连接".to_string(),
             Link::Connected => match self.status.state {
                 RunState::Idle => "未连接".to_string(),
@@ -283,6 +399,8 @@ impl GuiState {
         Some(format!("{cut}…"))
     }
 }
+
+const RESTARTING: &str = "配置已保存，服务正在重启…";
 
 /// "1h23m" style elapsed since a unix timestamp, empty when in the future or
 /// unknown-time. chrono would be overkill: wall-clock minutes are enough.
@@ -330,6 +448,8 @@ mod tests {
     fn icon_and_status_line_follow_the_link_and_state() {
         let mut state = GuiState::default();
         assert_eq!(state.icon_kind(), IconKind::Dead);
+        assert_eq!(state.status_line(), "服务未安装");
+        state.service.installed = true;
         assert_eq!(state.status_line(), "守护进程未连接");
 
         state.on_connected();
@@ -443,6 +563,97 @@ mod tests {
         // but not a second one over a standing prompt
         state.prompt = Some(LoginPrompt::EmailCode);
         assert!(state.open_login().is_none());
+    }
+
+    fn reply(id: u64, ok: bool, error: Option<&str>) -> FromDaemon {
+        FromDaemon::Reply {
+            id,
+            ok,
+            error: error.map(str::to_string),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn saving_settings_waits_for_the_disconnect_then_the_restart() {
+        let mut state = GuiState::default();
+        state.on_connected();
+        state.service_busy = true;
+        state.reconfig = Reconfig::Disconnecting(7);
+
+        // replies to other requests change nothing
+        state.apply(&reply(6, true, None));
+        assert_eq!(state.reconfig, Reconfig::Disconnecting(7));
+        // the session is down: time to write
+        state.apply(&reply(7, true, None));
+        assert_eq!(state.reconfig, Reconfig::WriteDue);
+
+        state.reconfig = Reconfig::Restarting(8);
+        state.apply(&reply(8, true, None));
+        assert_eq!(state.reconfig, Reconfig::Idle);
+        assert!(!state.service_busy);
+        assert!(!state.service_notice.as_ref().unwrap().error);
+
+        // a daemon launchd did not start refuses to restart
+        state.service_busy = true;
+        state.reconfig = Reconfig::Restarting(9);
+        state.apply(&reply(9, false, Some("not started by launchd")));
+        let notice = state.service_notice.clone().unwrap();
+        assert!(notice.error && notice.text.contains("not started by launchd"));
+        assert!(!state.service_busy);
+    }
+
+    #[test]
+    fn a_daemon_going_away_moves_the_save_along() {
+        let mut state = GuiState::default();
+        state.on_connected();
+        // gone before the disconnect reply: nothing can save over the file
+        state.reconfig = Reconfig::Disconnecting(3);
+        state.on_disconnected();
+        assert_eq!(state.reconfig, Reconfig::WriteDue);
+
+        // a restart takes the daemon down with its reply
+        state.on_connected();
+        state.service_busy = true;
+        state.reconfig = Reconfig::Restarting(4);
+        state.on_disconnected();
+        assert_eq!(state.reconfig, Reconfig::Idle);
+        assert!(!state.service_busy);
+        assert!(!state.service_notice.unwrap().error);
+    }
+
+    #[test]
+    fn the_server_split_dns_list_outlives_the_session() {
+        let mut state = GuiState::default();
+        state.on_connected();
+        state.apply(&FromDaemon::StatusChanged {
+            status: Status {
+                state: RunState::Online,
+                server_split_dns_domains: vec!["*.corp.example".into()],
+                ..Status::default()
+            },
+        });
+        assert_eq!(state.server_split_dns, ["*.corp.example"]);
+        // disconnected: the status has no list, the last one stays
+        state.apply(&FromDaemon::StatusChanged {
+            status: Status {
+                state: RunState::Idle,
+                ..Status::default()
+            },
+        });
+        assert_eq!(state.server_split_dns, ["*.corp.example"]);
+    }
+
+    #[test]
+    fn another_daemon_build_is_noticed() {
+        let mut state = GuiState::default();
+        state.status.version = "0.0.1".into();
+        // nothing to compare without a daemon
+        assert!(!state.version_mismatch());
+        state.on_connected();
+        assert!(state.version_mismatch());
+        state.status.version = env!("CARGO_PKG_VERSION").into();
+        assert!(!state.version_mismatch());
     }
 
     #[test]

@@ -10,7 +10,9 @@
 //!
 //! This crate is deliberately dependency-light (serde only): the daemon links
 //! the Go wireguard library and the GUI must not, so both sides share the
-//! protocol through this crate instead of through the daemon crate.
+//! protocol through this crate instead of through the daemon crate. The few
+//! other facts both ends must agree on live here too: where the socket and
+//! the default config file are, and how a company code is looked up.
 
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -42,6 +44,39 @@ pub fn socket_candidates() -> Vec<PathBuf> {
         Some(path) => vec![PathBuf::from(path)],
         None => vec![Path::new("/var/run").join(SOCK_NAME), env::temp_dir().join(SOCK_NAME)],
     }
+}
+
+// ------------------------------------------------------------------- config
+
+/// The config file corplink-rs uses when given none, under the home of the
+/// user it runs for: `~/.config/corplink-rs/config.json`. The daemon keeps
+/// its cookies next to whichever config file it runs with, so by default the
+/// whole state lives in this one directory.
+pub fn default_config_file(home: &Path) -> PathBuf {
+    home.join(".config").join("corplink-rs").join("config.json")
+}
+
+/// Turns a company code into the company's corplink server; used by the
+/// daemon and by the GUI's setup, which checks the code before saving it.
+pub const COMPANY_LOOKUP_URL: &str = "https://corplink.volcengine.cn/api/match";
+
+/// A split DNS domain as the daemon uses it: trimmed, lowercased, one
+/// trailing dot dropped, and a plain DNS name. It becomes a file name under
+/// /etc/resolver, written by the root daemon, so only non-empty labels of
+/// ascii letters, digits and hyphens pass: no path separators, no `.`/`..`.
+/// The GUI checks what it saves with the very same rule.
+pub fn normalize_domain(domain: &str) -> Option<String> {
+    let domain = domain.trim().to_ascii_lowercase();
+    let domain = domain.strip_suffix('.').unwrap_or(&domain);
+    let valid = domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    valid.then(|| domain.to_string())
 }
 
 // ------------------------------------------------------------- GUI -> daemon
@@ -87,6 +122,12 @@ pub enum ToDaemon {
     /// The last `tail` buffered log lines; live lines then arrive as
     /// [`FromDaemon::LogLine`] events.
     Logs { id: u64, tail: u32 },
+
+    /// Restart the daemon so it reads its config file again: it tears the
+    /// session down and exits for launchd to start it anew, so the reply may
+    /// be the last frame of the connection. Refused when launchd did not
+    /// start the daemon, since nothing would bring it back.
+    Restart { id: u64 },
 }
 
 // ------------------------------------------------------------- daemon -> GUI
@@ -155,6 +196,11 @@ pub struct Status {
     pub protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub split_dns_domains: Vec<String>,
+    /// The split DNS domains the company's server suggests for the current
+    /// session, as it sends them (`*.` wildcards included); the GUI offers to
+    /// import them into the config's `split_dns_domains`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_split_dns_domains: Vec<String>,
     /// Daemon crate version, for the GUI to notice mismatches.
     #[serde(default)]
     pub version: String,
@@ -173,6 +219,19 @@ pub struct VpnServer {
     /// `None` when the probe failed (unreachable or needs login).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<i64>,
+}
+
+impl VpnServer {
+    /// The name to show and to connect with: the English name, else the
+    /// localized one, which some companies leave as the only one. The daemon
+    /// reports the connected server ([`Status::server`]) the same way.
+    pub fn display_name(&self) -> &str {
+        if self.en_name.is_empty() {
+            &self.name
+        } else {
+            &self.en_name
+        }
+    }
 }
 
 // -------------------------------------------------------------- login prompts
@@ -205,6 +264,7 @@ mod tests {
             ToDaemon::LoginReply { id: 7, value: "123456".into() },
             ToDaemon::LoginCancel { id: 8 },
             ToDaemon::Logs { id: 9, tail: 200 },
+            ToDaemon::Restart { id: 10 },
         ];
         for msg in &msgs {
             let line = encode(msg);
@@ -227,6 +287,7 @@ mod tests {
             dns: Some("10.2.2.17".into()),
             protocol: Some("tcp".into()),
             split_dns_domains: vec!["corp.example".into()],
+            server_split_dns_domains: vec!["*.corp.example".into(), "gitlab.example".into()],
             version: "0.6.0".into(),
             detail: None,
         };
@@ -291,5 +352,26 @@ mod tests {
         assert!(decode::<FromDaemon>("{\"t\":\"nope\"}").is_err());
         // a bare string or array is not a message
         assert!(decode::<ToDaemon>("\"status\"").is_err());
+    }
+
+    #[test]
+    fn servers_go_by_their_english_name_else_their_name() {
+        let mut server = VpnServer {
+            name: "节点三".into(),
+            en_name: "Node03".into(),
+            protocol: "tcp".into(),
+            latency_ms: None,
+        };
+        assert_eq!(server.display_name(), "Node03");
+        server.en_name.clear();
+        assert_eq!(server.display_name(), "节点三");
+    }
+
+    #[test]
+    fn the_default_config_lives_in_the_home_config_directory() {
+        assert_eq!(
+            default_config_file(Path::new("/Users/someone")),
+            Path::new("/Users/someone/.config/corplink-rs/config.json")
+        );
     }
 }

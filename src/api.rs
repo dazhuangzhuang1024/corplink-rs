@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::template::Template;
 
-pub const URL_GET_COMPANY: &str = "https://corplink.volcengine.cn/api/match";
+pub const URL_GET_COMPANY: &str = corplink_ipc::COMPANY_LOOKUP_URL;
 pub(crate) const CORPLINK_APP_VERSION: &str = "201000";
 
 const URL_GET_LOGIN_METHOD: &str = "{{url}}/api/login/setting?os={{os}}&os_version={{version}}";
