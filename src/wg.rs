@@ -5,6 +5,28 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::{config, utils};
 
+const FIRST_HANDSHAKE_POLL: time::Duration = time::Duration::from_secs(1);
+const FIRST_HANDSHAKE_TIMEOUT: time::Duration = time::Duration::from_secs(20);
+const STALE_HANDSHAKE_TIMEOUT: time::Duration = time::Duration::from_secs(5 * 60);
+
+fn parse_last_handshake(data: &[u8]) -> Result<Option<i64>> {
+    let response = std::str::from_utf8(data).context("failed to decode uapi response")?;
+    let mut handshake = None;
+    for line in response.lines() {
+        if let Some(value) = line.strip_prefix("last_handshake_time_sec=") {
+            let timestamp = value
+                .parse::<i64>()
+                .with_context(|| format!("invalid last handshake timestamp {value:?}"))?;
+            handshake = (timestamp != 0).then_some(timestamp);
+        } else if let Some(errno) = line.strip_prefix("errno=") {
+            if errno != "0" {
+                return Err(anyhow!("uapi returned errno={errno}"));
+            }
+        }
+    }
+    Ok(handshake)
+}
+
 #[allow(clippy::all)]
 #[allow(
     dead_code,
@@ -208,93 +230,100 @@ impl UAPIClient {
         Ok(())
     }
 
-    pub async fn check_wg_connection(&mut self) {
-        // default refresh key timeout of wg is 2 min
-        // we set wg connection timeout to 5 min
-        let interval = time::Duration::from_secs(5 * 60);
-        // with a 10s persistent keepalive the first handshake comes within
-        // seconds; a tunnel still without one after `interval` never got up
-        let started = time::Instant::now();
-        let mut ticker = tokio::time::interval(interval);
-        let mut timeout = false;
-        // consume the first tick
-        ticker.tick().await;
-        while !timeout {
-            ticker.tick().await;
+    fn last_handshake(&self) -> Result<Option<i64>> {
+        let data = uapi(b"get=1\n\n").with_context(|| format!("call uapi for {}", self.name))?;
+        parse_last_handshake(&data)
+    }
 
-            let name = self.name.as_str();
-            let data = match uapi(b"get=1\n\n") {
-                Ok(data) => data,
-                Err(e) => {
-                    log::warn!("failed to call uapi for {}: {}", name, e);
-                    continue;
+    /// Wait for a real handshake before the GUI is told that the tunnel is
+    /// online. A configured local utun by itself is not a working VPN.
+    ///
+    /// Every session starts a new device whose peer is replaced on config, so
+    /// any handshake time it reports belongs to this session. It must not be
+    /// compared with the session start: the handshake begins as soon as the
+    /// peer is up, while installing routes and DNS can take seconds longer,
+    /// and the next one only comes with the rekey minutes later.
+    pub async fn wait_for_first_handshake(&mut self) -> bool {
+        let started = time::Instant::now();
+        loop {
+            match self.last_handshake() {
+                Ok(Some(_)) => {
+                    log::info!("first handshake completed for {}", self.name);
+                    return true;
                 }
-            };
-            let s = match String::from_utf8(data) {
-                Ok(s) => s,
+                Ok(None) => {}
                 Err(err) => {
-                    log::warn!("failed to parse uapi response for {}: {}", name, err);
+                    log::warn!("failed to inspect first handshake for {}: {err}", self.name)
+                }
+            }
+            if started.elapsed() >= FIRST_HANDSHAKE_TIMEOUT {
+                log::warn!(
+                    "no handshake with the server within {}s of starting",
+                    FIRST_HANDSHAKE_TIMEOUT.as_secs()
+                );
+                return false;
+            }
+            tokio::time::sleep(FIRST_HANDSHAKE_POLL).await;
+        }
+    }
+
+    pub async fn check_wg_connection(&mut self) {
+        // WireGuard refreshes keys after roughly two minutes. Five minutes
+        // without another handshake means the established tunnel is stale.
+        let mut ticker = tokio::time::interval(STALE_HANDSHAKE_TIMEOUT);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let name = self.name.as_str();
+            let timestamp = match self.last_handshake() {
+                Ok(Some(timestamp)) => timestamp,
+                Ok(None) => {
+                    log::warn!("no last handshake reported for {name}");
+                    return;
+                }
+                Err(err) => {
+                    log::warn!("failed to inspect last handshake for {name}: {err}");
                     continue;
                 }
             };
-            for line in s.split('\n') {
-                if line.starts_with("last_handshake_time_sec") {
-                    let last = match line.trim_end().split('=').next_back() {
-                        Some(v) => v,
-                        None => {
-                            log::warn!("unexpected uapi line: {}", line);
-                            continue;
-                        }
-                    };
-                    match last.parse::<i64>() {
-                        Ok(timestamp) => {
-                            if timestamp == 0 {
-                                if started.elapsed() >= interval {
-                                    log::warn!(
-                                        "no handshake with the server within {}s of starting",
-                                        interval.as_secs()
-                                    );
-                                    timeout = true;
-                                }
-                            } else if let Some(nt) = chrono::DateTime::from_timestamp(timestamp, 0)
-                            {
-                                let now = chrono::Utc::now().to_utc();
-                                let t = now - nt;
-                                let tt = nt.to_utc();
-                                let lt = tt.with_timezone(&chrono::Local);
-                                if let Ok(elapsed) = t.to_std() {
-                                    let elapsed = elapsed.as_secs_f32();
-                                    log::info!(
-                                        "last handshake is at {lt}, elapsed time {elapsed}s"
-                                    );
-                                    if let Ok(interval_dur) = chrono::Duration::from_std(interval) {
-                                        if t > interval_dur {
-                                            log::warn!(
-                                                    "last handshake is at {}, elapsed time {}s more than {}s",
-                                                    lt,
-                                                    elapsed,
-                                                    interval.as_secs()
-                                                );
-                                            timeout = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            log::warn!("parse last handshake of {} fail: {}", name, err)
-                        }
+            if let Some(handshake) = chrono::DateTime::from_timestamp(timestamp, 0) {
+                let elapsed = chrono::Utc::now().to_utc() - handshake;
+                let local = handshake.to_utc().with_timezone(&chrono::Local);
+                if let Ok(duration) = elapsed.to_std() {
+                    let seconds = duration.as_secs_f32();
+                    log::info!("last handshake is at {local}, elapsed time {seconds}s");
+                    if duration > STALE_HANDSHAKE_TIMEOUT {
+                        log::warn!(
+                            "last handshake is at {}, elapsed time {}s more than {}s",
+                            local,
+                            seconds,
+                            STALE_HANDSHAKE_TIMEOUT.as_secs()
+                        );
+                        return;
                     }
-                    break;
-                } else if line.starts_with("errno") {
-                    if line != "errno=0" {
-                        log::warn!("uapi of {} return: fail: {}", name, line)
-                    }
-                } else if line.is_empty() {
-                    // reach end
-                    break;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_last_handshake;
+
+    #[test]
+    fn parses_last_handshake_from_uapi() {
+        let response = b"private_key=abc\nlast_handshake_time_sec=123\nerrno=0\n\n";
+        assert_eq!(parse_last_handshake(response).unwrap(), Some(123));
+        assert_eq!(
+            parse_last_handshake(b"last_handshake_time_sec=0\nerrno=0\n\n").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_failed_uapi_responses() {
+        assert!(parse_last_handshake(b"last_handshake_time_sec=nope\nerrno=0\n").is_err());
+        assert!(parse_last_handshake(b"last_handshake_time_sec=1\nerrno=5\n").is_err());
     }
 }

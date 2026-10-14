@@ -320,6 +320,7 @@ const RETRY_BACKOFF_CAP_SECS: u64 = 300;
 /// How long an unattended failure waits for a GUI that may be attaching right
 /// now (it races the first network failure) before the process exits.
 const GUI_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+const VPN_DNS_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// libwg cannot restart netstack mode within a process: stopWg leaves the
 /// SOCKS5 listener of the stopped session bound, so every later start fails
@@ -327,6 +328,18 @@ const GUI_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// process, as it always did.
 const NETSTACK_NO_RESTART: &str =
     "netstack (socks5) mode cannot restart the tunnel in-process; restart corplink-rs instead";
+
+/// What the watchdog of a session reports. A new tunnel first reports
+/// whether it came up; once online, the watchdog only returns when it goes
+/// stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelWatchEvent {
+    /// the first handshake completed and the VPN DNS answered through it
+    Ready,
+    NoHandshake,
+    DnsUnreachable,
+    Stale,
+}
 
 fn retry_backoff(failures: u32) -> std::time::Duration {
     let shift = failures.saturating_sub(1).min(5);
@@ -387,9 +400,11 @@ async fn supervise(
     // resources (bring_up runs inline below precisely so an abort can never
     // leave a half-started tunnel behind)
     let mut connect_task: Option<tokio::task::JoinHandle<Result<WgConf>>>;
-    // completes when the tunnel stops handshaking
-    let mut watchdog: Option<tokio::task::JoinHandle<()>> = None;
+    // First reports that a new tunnel handshook; once online, completes again
+    // only when the established tunnel goes stale.
+    let mut watchdog: Option<tokio::task::JoinHandle<TunnelWatchEvent>> = None;
     let mut failures: u32 = 0;
+    let mut failed_servers: Vec<String> = Vec::new();
     let mut detail: Option<String> = None;
     // the server the user pinned for this session; retries keep it, only a
     // connect without a server goes back to the configured selection
@@ -426,7 +441,11 @@ async fn supervise(
     tokio::pin!(shutdown);
 
     // auto-connect at startup, exactly as the daemon always did
-    connect_task = Some(tokio::spawn(connect_session(client.clone(), None)));
+    connect_task = Some(tokio::spawn(connect_session(
+        client.clone(),
+        None,
+        Vec::new(),
+    )));
 
     loop {
         tokio::select! {
@@ -461,6 +480,7 @@ async fn supervise(
                             log::info!("selecting VPN server {server:?} from the GUI");
                         }
                         pinned_server = server;
+                        failed_servers.clear();
                         phase = Phase::Connecting;
                         failures = 0;
                         detail = None;
@@ -468,6 +488,7 @@ async fn supervise(
                         connect_task = Some(tokio::spawn(connect_session(
                             client.clone(),
                             pinned_server.clone(),
+                            Vec::new(),
                         )));
                         let _ = reply.send(Ok(()));
                     }
@@ -537,13 +558,29 @@ async fn supervise(
                 };
                 match res {
                     Ok(session) => {
-                        failures = 0;
-                        detail = None;
-                        phase = Phase::Online;
+                        detail = Some("waiting for the first WireGuard handshake".to_string());
+                        phase = Phase::Connecting;
                         let watch_name = params.name.clone();
+                        // Tunnel health is independent of split-DNS policy and
+                        // business domains. Probe only the VPN-assigned DNS
+                        // addresses routed into the tunnel, using a fixed
+                        // non-business query name.
+                        let dns_readiness = if params.netstack_mode {
+                            Vec::new()
+                        } else {
+                            dns::tunnel_dns_servers(&session.wg_conf.dns, &session.wg_conf.routes)
+                        };
                         watchdog = Some(tokio::spawn(async move {
                             let mut uapi = wg::UAPIClient { name: watch_name };
-                            uapi.check_wg_connection().await;
+                            if !uapi.wait_for_first_handshake().await {
+                                return TunnelWatchEvent::NoHandshake;
+                            }
+                            if !dns::wait_for_dns_response(&dns_readiness, VPN_DNS_READY_TIMEOUT)
+                                .await
+                            {
+                                return TunnelWatchEvent::DnsUnreachable;
+                            }
+                            TunnelWatchEvent::Ready
                         }));
                         publish(phase, Some(&session), detail.clone());
                         active = Some(session);
@@ -588,9 +625,14 @@ async fn supervise(
                             ));
                             let retry_client = client.clone();
                             let retry_pin = pinned_server.clone();
+                            let retry_excluded = if retry_pin.is_none() {
+                                failed_servers.clone()
+                            } else {
+                                Vec::new()
+                            };
                             connect_task = Some(tokio::spawn(async move {
                                 tokio::time::sleep(wait).await;
-                                connect_session(retry_client, retry_pin).await
+                                connect_session(retry_client, retry_pin, retry_excluded).await
                             }));
                         } else {
                             phase = Phase::Idle;
@@ -601,32 +643,82 @@ async fn supervise(
                 }
             }
 
-            _ = async {
+            event = async {
                 match watchdog.as_mut() {
                     Some(task) => task.await.expect("the watchdog must not panic"),
-                    None => std::future::pending().await,
+                    None => std::future::pending::<TunnelWatchEvent>().await,
                 }
             }, if watchdog.is_some() => {
                 watchdog = None;
-                log::warn!("last handshake timeout");
+                let reason = match event {
+                    TunnelWatchEvent::Ready => {
+                        log::info!("WireGuard tunnel is online");
+                        failures = 0;
+                        failed_servers.clear();
+                        phase = Phase::Online;
+                        detail = None;
+                        publish(phase, active.as_ref(), detail.clone());
+                        let watch_name = params.name.clone();
+                        watchdog = Some(tokio::spawn(async move {
+                            let mut uapi = wg::UAPIClient { name: watch_name };
+                            uapi.check_wg_connection().await;
+                            TunnelWatchEvent::Stale
+                        }));
+                        continue;
+                    }
+                    TunnelWatchEvent::NoHandshake => "no WireGuard handshake with the VPN server",
+                    TunnelWatchEvent::DnsUnreachable => {
+                        "the VPN DNS did not answer through the tunnel"
+                    }
+                    TunnelWatchEvent::Stale => "the WireGuard handshake became stale",
+                };
+                log::warn!("{reason}");
+                // a node whose tunnel never came up is skipped by the next
+                // automatic pick; a stale tunnel worked until now, more
+                // likely the local network changed than the node broke
+                if pinned_server.is_none() && event != TunnelWatchEvent::Stale {
+                    if let Some(session) = &active {
+                        if !failed_servers.contains(&session.wg_conf.server_name) {
+                            failed_servers.push(session.wg_conf.server_name.clone());
+                        }
+                    }
+                }
                 if let Some(session) = active.take() {
                     teardown(&params, session, &client).await;
                 }
                 if !bridge.ever_had_gui() || netstack_spent {
-                    // exit and let launchd restart us, as before the GUI; a
-                    // netstack tunnel cannot come back in this process anyway
                     remove_socket(&ipc_path);
                     exit(ETIMEDOUT);
                 }
-                // attended: reconnect in place, skipping launchd's restart
-                // throttle
-                phase = Phase::Connecting;
-                detail = Some("reconnecting after the handshake timed out".to_string());
-                publish(phase, None, detail.clone());
-                connect_task = Some(tokio::spawn(connect_session(
-                    client.clone(),
-                    pinned_server.clone(),
-                )));
+                if failures < MAX_AUTO_RETRIES {
+                    failures += 1;
+                    let retry_excluded = if pinned_server.is_none() {
+                        failed_servers.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    phase = Phase::Connecting;
+                    detail = Some(if retry_excluded.is_empty() {
+                        format!("{reason}; reconnecting")
+                    } else {
+                        format!(
+                            "{reason}; trying another node first (failed: {})",
+                            retry_excluded.join(", ")
+                        )
+                    });
+                    publish(phase, None, detail.clone());
+                    connect_task = Some(tokio::spawn(connect_session(
+                        client.clone(),
+                        pinned_server.clone(),
+                        retry_excluded,
+                    )));
+                } else {
+                    phase = Phase::Idle;
+                    detail = Some(format!(
+                        "{reason}; no healthy VPN node after {MAX_AUTO_RETRIES} retries"
+                    ));
+                    publish(phase, None, detail.clone());
+                }
             }
         }
     }
@@ -636,7 +728,7 @@ async fn supervise(
 /// with its watchdog.
 async fn stop_all(
     connect_task: &mut Option<tokio::task::JoinHandle<Result<WgConf>>>,
-    watchdog: &mut Option<tokio::task::JoinHandle<()>>,
+    watchdog: &mut Option<tokio::task::JoinHandle<TunnelWatchEvent>>,
     active: &mut Option<ActiveSession>,
     bridge: &LoginBridge,
     params: &SessionParams,
@@ -661,6 +753,7 @@ async fn stop_all(
 async fn connect_session(
     client: Arc<tokio::sync::Mutex<Client>>,
     pin_server: Option<String>,
+    excluded_servers: Vec<String>,
 ) -> Result<WgConf> {
     let mut c = client.lock().await;
     let mut logout_retry = true;
@@ -672,7 +765,7 @@ async fn connect_session(
         }
         c.set_vpn_server_override(pin_server.clone());
         log::info!("try to connect");
-        match c.connect_vpn().await {
+        match c.connect_vpn_excluding(&excluded_servers).await {
             Ok(conf) => return Ok(conf),
             Err(e) => {
                 if logout_retry && e.to_string().contains("logout") {
@@ -803,7 +896,8 @@ async fn bring_up(params: &SessionParams, wg_conf: WgConf) -> Result<ActiveSessi
     })
 }
 
-/// Undo a session, in the same order the old straight-line shutdown used.
+/// Undo a session. Drop local routes before calling the control plane: a dead
+/// tunnel may otherwise black-hole the request that releases or switches it.
 async fn teardown(
     params: &SessionParams,
     mut session: ActiveSession,
@@ -814,6 +908,18 @@ async fn teardown(
     #[cfg(target_os = "macos")]
     if let Err(err) = session.resolver_files.remove() {
         log::warn!("{:#}", err);
+    }
+
+    wg::stop_wg_go();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if params.use_vpn_dns && !params.netstack_mode {
+        match session.dns_manager.restore_dns() {
+            Ok(_) => {}
+            Err(err) => {
+                log::warn!("failed to delete dns: {}", err);
+            }
+        }
     }
 
     log::info!("disconnecting vpn...");
@@ -829,18 +935,6 @@ async fn teardown(
             if let Err(e) = c.logout().await {
                 log::warn!("failed to logout: {}", e)
             };
-        }
-    }
-
-    wg::stop_wg_go();
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if params.use_vpn_dns && !params.netstack_mode {
-        match session.dns_manager.restore_dns() {
-            Ok(_) => {}
-            Err(err) => {
-                log::warn!("failed to delete dns: {}", err);
-            }
         }
     }
 }

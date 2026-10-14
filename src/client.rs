@@ -79,6 +79,22 @@ fn matches_vpn_server_name(vpn: &RespVpnInfo, expected: Option<&str>) -> bool {
     expected.is_none_or(|name| vpn.name == name || vpn.en_name == name)
 }
 
+fn vpn_server_is_excluded(vpn: &RespVpnInfo, excluded: &[String]) -> bool {
+    excluded
+        .iter()
+        .any(|name| vpn.name == *name || vpn.en_name == *name)
+}
+
+fn carve_routes(mut routes: Vec<String>, excluded: &[String]) -> Vec<String> {
+    for cidr in excluded {
+        routes = routes
+            .iter()
+            .flat_map(|route| crate::utils::subtract_cidr_from_cidr(route, cidr))
+            .collect();
+    }
+    routes
+}
+
 fn merge_additional_routes(
     mut routes: Vec<String>,
     additional_routes: &[String],
@@ -157,6 +173,62 @@ async fn resolve_additional_domains(
                 );
             }
         }
+    }
+    routes
+}
+
+/// The control server answered moments ago, so its name is normally cached;
+/// a slow lookup must not hold up the connect.
+const CONTROL_SERVER_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn resolve_control_server_routes(
+    server: Option<&str>,
+    has_ipv6_address: bool,
+) -> Vec<String> {
+    let Some(server) = server else {
+        return Vec::new();
+    };
+    let host = match Url::parse(server)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        Some(host) => host,
+        None => {
+            log::warn!("could not find a host in control server URL {server:?}");
+            return Vec::new();
+        }
+    };
+    let mut routes = Vec::new();
+    let lookup = tokio::time::timeout(
+        CONTROL_SERVER_LOOKUP_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), 0)),
+    );
+    match lookup.await {
+        Ok(Ok(addresses)) => {
+            for address in addresses {
+                let ip = address.ip();
+                if ip.is_ipv6() && !has_ipv6_address {
+                    continue;
+                }
+                let route = match ip {
+                    IpAddr::V4(_) => format!("{ip}/32"),
+                    IpAddr::V6(_) => format!("{ip}/128"),
+                };
+                if !routes.contains(&route) {
+                    routes.push(route);
+                }
+            }
+            if routes.is_empty() {
+                log::warn!("control server {host:?} returned no usable addresses");
+            } else {
+                log::info!("control server {host:?} stays outside the VPN via {routes:?}");
+            }
+        }
+        Ok(Err(err)) => log::warn!("failed to resolve control server {host:?}: {err}"),
+        Err(_) => log::warn!(
+            "resolving control server {host:?} took over {}s, not excluding it from the VPN",
+            CONTROL_SERVER_LOOKUP_TIMEOUT.as_secs()
+        ),
     }
     routes
 }
@@ -1161,7 +1233,44 @@ impl Client {
         }
     }
 
-    pub async fn connect_vpn(&mut self) -> Result<WgConf> {
+    /// Pick a node by the configured strategy.
+    async fn select_vpn(&self, candidates: Vec<RespVpnInfo>) -> Result<Option<SelectedVpn>> {
+        Ok(match self.conf.vpn_select_strategy.as_deref() {
+            Some(STRATEGY_LATENCY) => self.get_first_vpn_by_latency(candidates).await,
+            Some(STRATEGY_DEFAULT) | None => self.get_first_available_vpn(candidates).await,
+            Some(_) => bail!("unsupported strategy"),
+        })
+    }
+
+    /// Pick a node, leaving the ones whose tunnels failed earlier in this
+    /// automatic failover round for last: they get another chance only when
+    /// no other node answers, so a single-node deployment keeps reconnecting.
+    async fn select_vpn_avoiding(
+        &self,
+        candidates: Vec<RespVpnInfo>,
+        failed_servers: &[String],
+    ) -> Result<Option<SelectedVpn>> {
+        let (candidates, failed): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|vpn| !vpn_server_is_excluded(vpn, failed_servers));
+        for vpn in &failed {
+            log::info!(
+                "trying other VPN servers before {}, whose tunnel failed",
+                vpn.display_name()
+            );
+        }
+        let selected = self.select_vpn(candidates).await?;
+        if selected.is_some() || failed.is_empty() {
+            return Ok(selected);
+        }
+        log::info!("no other VPN server is available, trying the failed ones again");
+        self.select_vpn(failed).await
+    }
+
+    /// Connect while trying nodes whose tunnels failed health checks during
+    /// this automatic retry cycle last. Explicitly pinned nodes are not
+    /// affected.
+    pub async fn connect_vpn_excluding(&mut self, excluded_servers: &[String]) -> Result<WgConf> {
         let vpn_info = self.list_vpn().await?;
 
         log::info!(
@@ -1184,7 +1293,8 @@ impl Client {
                 bail!("no VPN server named {name:?}, available: {available:?}");
             }
         }
-        let filtered_vpn = vpn_info
+        let automatic_selection = self.conf.effective_vpn_server_name().is_none();
+        let filtered_vpn: Vec<RespVpnInfo> = vpn_info
             .into_iter()
             .filter(|vpn| {
                 let server_name = self.conf.effective_vpn_server_name();
@@ -1220,16 +1330,15 @@ impl Client {
             })
             .collect();
 
-        let vpn = match self.conf.vpn_select_strategy.clone() {
-            Some(strategy) => match strategy.as_str() {
-                STRATEGY_LATENCY => self.get_first_vpn_by_latency(filtered_vpn).await,
-                STRATEGY_DEFAULT => self.get_first_available_vpn(filtered_vpn).await,
-                _ => bail!("unsupported strategy"),
-            },
-            None => self.get_first_available_vpn(filtered_vpn).await,
+        let failed_servers = if automatic_selection {
+            excluded_servers
+        } else {
+            &[]
         };
-
-        let selected_vpn = vpn.context("no vpn available")?;
+        let selected_vpn = self
+            .select_vpn_avoiding(filtered_vpn, failed_servers)
+            .await?
+            .context("no vpn available")?;
         let vpn = &selected_vpn.vpn;
         let endpoint_url = self.prepare_vpn_endpoint(&vpn.ip, vpn.api_port)?;
         // Persist only cookies returned by the selected endpoint probe.
@@ -1390,31 +1499,18 @@ impl Client {
             );
         }
 
-        // Auto-carve the VPN peer endpoint IP out of allowed_ips. In full-tunnel mode
-        // the server typically returns 0.0.0.0/0, which would match the outer UDP
-        // packets going to the peer itself, producing a routing loop (black hole).
-        // Mirrors wg-quick's behavior of excluding the endpoint from routes. No-op
-        // when the peer IP isn't covered by any allowed_ip (e.g. split mode).
+        // Keep both the WireGuard peer and CorpLink's control server outside
+        // AllowedIPs. Otherwise a broken tunnel can black-hole the requests
+        // needed to list, disconnect, or switch VPN nodes.
+        let mut automatic_route_exclusions =
+            resolve_control_server_routes(self.conf.server.as_deref(), has_ipv6_address).await;
         match vpn.ip.parse::<std::net::IpAddr>() {
             Ok(peer_ip) => {
                 let peer_cidr = match peer_ip {
                     std::net::IpAddr::V4(_) => format!("{}/32", peer_ip),
                     std::net::IpAddr::V6(_) => format!("{}/128", peer_ip),
                 };
-                let before = allowed_ips.len();
-                let mut carved = Vec::with_capacity(allowed_ips.len());
-                for a in &allowed_ips {
-                    carved.extend(crate::utils::subtract_cidr_from_cidr(a, &peer_cidr));
-                }
-                if carved.len() != before {
-                    log::info!(
-                        "auto-carved peer endpoint {} out of allowed_ips: {} -> {} entries",
-                        peer_cidr,
-                        before,
-                        carved.len()
-                    );
-                }
-                allowed_ips = carved;
+                automatic_route_exclusions.push(peer_cidr);
             }
             Err(e) => {
                 log::warn!(
@@ -1423,6 +1519,16 @@ impl Client {
                     e
                 );
             }
+        }
+        if !automatic_route_exclusions.is_empty() {
+            let before = allowed_ips.len();
+            allowed_ips = carve_routes(allowed_ips, &automatic_route_exclusions);
+            log::info!(
+                "automatic route exclusions {:?} applied: {} -> {} entries",
+                automatic_route_exclusions,
+                before,
+                allowed_ips.len()
+            );
         }
         log::info!(
             "final allowed_ips ({} entries): {:?}",
@@ -1580,8 +1686,9 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        cookie_file_path, matches_vpn_server_name, merge_additional_routes,
-        open_cookie_file_for_write, resolve_additional_domains, Client, ReqwestCookieStore,
+        carve_routes, cookie_file_path, matches_vpn_server_name, merge_additional_routes,
+        open_cookie_file_for_write, resolve_additional_domains, vpn_server_is_excluded, Client,
+        ReqwestCookieStore,
     };
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
@@ -1660,6 +1767,35 @@ mod tests {
         assert!(matches_vpn_server_name(&vpn, Some("node-local")));
         assert!(matches_vpn_server_name(&vpn, Some("node-en")));
         assert!(!matches_vpn_server_name(&vpn, Some("another-node")));
+    }
+
+    #[test]
+    fn automatic_failover_matches_both_server_names() {
+        let vpn = vpn_info(443, "node-en");
+        assert!(vpn_server_is_excluded(&vpn, &["node-en".into()]));
+        assert!(vpn_server_is_excluded(
+            &vpn,
+            std::slice::from_ref(&vpn.name)
+        ));
+        assert!(!vpn_server_is_excluded(&vpn, &["another-node".into()]));
+    }
+
+    #[test]
+    fn automatic_route_exclusions_punch_control_and_peer_holes() {
+        let carved = carve_routes(
+            vec!["0.0.0.0/0".into()],
+            &["203.0.113.10/32".into(), "198.51.100.20/32".into()],
+        );
+        for excluded in ["203.0.113.10", "198.51.100.20"] {
+            assert!(!crate::utils::cidrs_contain_ip(
+                &carved,
+                excluded.parse().unwrap()
+            ));
+        }
+        assert!(crate::utils::cidrs_contain_ip(
+            &carved,
+            "8.8.8.8".parse().unwrap()
+        ));
     }
 
     #[cfg(unix)]
@@ -1892,6 +2028,63 @@ mod tests {
         fast_request.await.unwrap();
         slow_task.await.unwrap();
         fast_task.await.unwrap();
+    }
+
+    /// A port nothing listens on: a probe there is refused at once.
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn failed_servers_are_tried_after_the_others() {
+        let (failed_port, _failed_request, failed_task) =
+            start_probe_server(Arc::new(Barrier::new(1)), Duration::ZERO, "failed").await;
+        let (other_port, _other_request, other_task) =
+            start_probe_server(Arc::new(Barrier::new(1)), Duration::ZERO, "other").await;
+        let client = test_client();
+        // listed first, so the default strategy would pick it
+        let candidates = vec![
+            vpn_info(failed_port, "failed"),
+            vpn_info(other_port, "other"),
+        ];
+
+        let selected = timeout(
+            Duration::from_secs(5),
+            client.select_vpn_avoiding(candidates, &["failed".to_string()]),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("no VPN was selected");
+
+        assert_eq!(selected.vpn.en_name, "other");
+        other_task.await.unwrap();
+        failed_task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_servers_get_another_chance_when_no_other_answers() {
+        // a single-node deployment, and one whose other node is down
+        for others in [Vec::new(), vec![vpn_info(closed_port().await, "down")]] {
+            let (failed_port, _failed_request, failed_task) =
+                start_probe_server(Arc::new(Barrier::new(1)), Duration::ZERO, "failed").await;
+            let client = test_client();
+            let mut candidates = others;
+            candidates.push(vpn_info(failed_port, "failed"));
+
+            let selected = timeout(
+                Duration::from_secs(5),
+                client.select_vpn_avoiding(candidates, &["failed".to_string()]),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the failed node was not tried again");
+
+            assert_eq!(selected.vpn.en_name, "failed");
+            failed_task.await.unwrap();
+        }
     }
 
     #[test]

@@ -163,7 +163,9 @@ mod tests {
         let record = log::Record::builder()
             .level(log::Level::Warn)
             .target("corplink_rs::dns")
-            .args(format_args!("split dns: removed /etc/resolver/corp.example"))
+            .args(format_args!(
+                "split dns: removed /etc/resolver/corp.example"
+            ))
             .build();
         let line = format_line(&record);
         assert!(line.starts_with('['));

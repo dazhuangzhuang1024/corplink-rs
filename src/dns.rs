@@ -1,4 +1,8 @@
 use anyhow::{Context, Result};
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+const READINESS_QUERY_DOMAIN: &str = "corplink-readiness.invalid";
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
@@ -11,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
-pub use resolver::{interface_exists, split_dns_servers, ResolverFiles, RESOLVER_DIR};
+pub use resolver::{interface_exists, ResolverFiles, RESOLVER_DIR};
 
 #[cfg(target_os = "linux")]
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -57,11 +61,145 @@ impl DNSManager {
     }
 }
 
+fn dns_query(domain: &str, id: u16) -> Option<Vec<u8>> {
+    let domain = corplink_ipc::normalize_domain(domain)?;
+    let mut query = Vec::with_capacity(domain.len() + 18);
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&0x0100_u16.to_be_bytes()); // recursion desired
+    query.extend_from_slice(&1_u16.to_be_bytes()); // one question
+    query.extend_from_slice(&[0; 6]); // no answers/authority/additional
+    for label in domain.split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&1_u16.to_be_bytes()); // A
+    query.extend_from_slice(&1_u16.to_be_bytes()); // IN
+    Some(query)
+}
+
+async fn dns_server_responds(server: IpAddr, query: &[u8], id: u16) -> bool {
+    let bind = match server {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    let request = async {
+        let socket = tokio::net::UdpSocket::bind(bind).await?;
+        socket.connect(SocketAddr::new(server, 53)).await?;
+        socket.send(query).await?;
+        let mut response = [0_u8; 512];
+        let len = socket.recv(&mut response).await?;
+        Ok::<bool, std::io::Error>(
+            len >= 12 && response[..2] == id.to_be_bytes() && response[2] & 0x80 != 0,
+        )
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), request).await,
+        Ok(Ok(true))
+    )
+}
+
+/// The servers in the VPN-assigned DNS setting, separated by commas or
+/// whitespace.
+pub fn split_dns_servers(dns_servers: &str) -> Vec<&str> {
+    dns_servers
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The VPN-assigned DNS servers whose queries are routed into the tunnel.
+/// Only these can vouch for the tunnel's data path: one outside the installed
+/// routes (split routes that skip it, route filters, `auto_setup_routes` off)
+/// is asked over the physical network and never answers.
+pub fn tunnel_dns_servers(dns_servers: &str, routes: &[String]) -> Vec<IpAddr> {
+    split_dns_servers(dns_servers)
+        .into_iter()
+        .filter_map(|server| match server.parse::<IpAddr>() {
+            Ok(ip) if crate::utils::cidrs_contain_ip(routes, ip) => Some(ip),
+            Ok(_) => {
+                log::info!("VPN DNS {server} is not routed through the tunnel, not probing it");
+                None
+            }
+            Err(_) => {
+                log::warn!("VPN DNS {server:?} is not an IP address, not probing it");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Confirm that the DNS assigned to the tunnel has a working data path. Any
+/// DNS response (including NXDOMAIN/REFUSED) is enough; this checks transport,
+/// not the particular record contents. Nothing to probe counts as ready.
+pub async fn wait_for_dns_response(servers: &[IpAddr], timeout: Duration) -> bool {
+    if servers.is_empty() {
+        log::info!("no VPN DNS is routed through the tunnel, skip the DNS readiness check");
+        return true;
+    }
+    let id = 0x4352;
+    let query = dns_query(READINESS_QUERY_DOMAIN, id)
+        .expect("the fixed DNS readiness query name must be valid");
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < timeout {
+        for server in servers {
+            if dns_server_responds(*server, &query, id).await {
+                log::info!("VPN DNS {server} answered a readiness query");
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    log::warn!("VPN DNS {servers:?} did not answer a readiness query");
+    false
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{dns_query, tunnel_dns_servers, wait_for_dns_response};
+    use std::time::Duration;
+
+    #[test]
+    fn readiness_query_encodes_a_plain_dns_name() {
+        let query = dns_query("api.example.com", 0x1234).unwrap();
+        assert_eq!(&query[..12], &[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&query[12..], b"\x03api\x07example\x03com\0\0\x01\0\x01");
+        assert!(dns_query("../invalid", 1).is_none());
+    }
+
+    #[test]
+    fn only_dns_routed_into_the_tunnel_is_probed() {
+        let routes = ["10.0.0.0/8".to_string(), "172.16.0.1".to_string()];
+        assert_eq!(
+            tunnel_dns_servers("10.2.2.17, 192.168.1.1 172.16.0.1,bogus", &routes),
+            [
+                "10.2.2.17".parse::<std::net::IpAddr>().unwrap(),
+                "172.16.0.1".parse().unwrap(),
+            ]
+        );
+        // auto_setup_routes off: nothing is routed, so nothing is probed
+        assert!(tunnel_dns_servers("10.2.2.17", &[]).is_empty());
+        assert!(tunnel_dns_servers("", &routes).is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_to_probe_counts_as_ready_at_once() {
+        let ready = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_dns_response(&[], Duration::from_secs(10)),
+        )
+        .await
+        .expect("an empty probe list must not sit out the timeout");
+        assert!(ready);
+    }
+}
+
 /// macOS per-domain split DNS through /etc/resolver files: the system-wide
 /// DNS settings stay untouched (unlike `DNSManager::set_dns`), only the listed
 /// domains are resolved by the DNS server assigned for this VPN session.
 #[cfg(any(target_os = "macos", test))]
 mod resolver {
+    use super::split_dns_servers;
     use anyhow::{bail, Context, Result};
     use std::fs;
     use std::io::{self, Read, Write};
@@ -359,15 +497,6 @@ mod resolver {
             .strip_suffix('\n')?;
         let name = quoted.strip_prefix('"')?.strip_suffix('"')?;
         (!name.is_empty() && !name.contains(['"', '\\'])).then_some(name)
-    }
-
-    /// The servers in the VPN-assigned DNS setting, separated by commas or
-    /// whitespace.
-    pub fn split_dns_servers(dns_servers: &str) -> Vec<&str> {
-        dns_servers
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .collect()
     }
 
     /// Whether a network interface with this name exists right now.

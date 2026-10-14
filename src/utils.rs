@@ -126,7 +126,6 @@ pub fn is_valid_cidr(cidr: &str) -> bool {
 
 /// Returns whether `ip` lies inside any of `cidrs`. Entries without a prefix
 /// length are single hosts, as in the wg allowed_ips list.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cidrs_contain_ip(cidrs: &[String], ip: IpAddr) -> bool {
     cidrs.iter().any(|cidr| match parse_cidr(cidr) {
         Some((base, prefix)) => cidr_contains_ip(base, prefix, ip),

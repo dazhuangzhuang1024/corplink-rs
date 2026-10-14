@@ -1029,7 +1029,10 @@ mod tests {
         let imported = import_split_dns("corp.example\nwiki.example", &["sec.example".to_string()]);
         assert_eq!(imported.text, "corp.example\nwiki.example\nsec.example");
         let after = review_split_dns(&imported.text, &suggested);
-        assert_eq!(after[4], listed("*.sec.example", "sec.example", "sec.example"));
+        assert_eq!(
+            after[4],
+            listed("*.sec.example", "sec.example", "sec.example")
+        );
         assert_eq!(after[0], new("gitlab.dev.example", "gitlab.dev.example"));
     }
 

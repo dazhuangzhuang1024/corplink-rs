@@ -83,6 +83,9 @@ pub struct GuiState {
     pub status: Status,
     pub servers: Vec<VpnServer>,
     pub servers_loading: bool,
+    /// Request that put the server picker into its loading state. Failed
+    /// replies carry no payload, so the id is needed to clear the spinner.
+    servers_request_id: Option<u64>,
     pub logs: VecDeque<String>,
     /// set once per connection after subscribing; live lines arrive as events
     pub logs_subscribed: bool,
@@ -117,6 +120,7 @@ impl Default for GuiState {
             status: Status::default(),
             servers: Vec::new(),
             servers_loading: false,
+            servers_request_id: None,
             logs: VecDeque::new(),
             logs_subscribed: false,
             prompt: None,
@@ -145,6 +149,7 @@ impl GuiState {
     pub fn on_connected(&mut self) -> Vec<ToDaemon> {
         self.link = Link::Connected;
         self.servers_loading = false;
+        self.servers_request_id = None;
         self.logs_subscribed = false;
         self.login_nudged = false;
         self.touch();
@@ -154,6 +159,7 @@ impl GuiState {
     pub fn on_disconnected(&mut self) {
         self.link = Link::Disconnected;
         self.servers_loading = false;
+        self.servers_request_id = None;
         self.logs_subscribed = false;
         self.prompt = None;
         match self.reconfig {
@@ -227,6 +233,11 @@ impl GuiState {
         error: Option<String>,
         data: Option<corplink_ipc::RespData>,
     ) {
+        if self.servers_request_id == Some(id) {
+            self.servers_loading = false;
+            self.servers_request_id = None;
+            self.touch();
+        }
         match self.reconfig {
             // written either way: a refused disconnect (a netstack tunnel
             // stays up) only leaves the restart's teardown to race the write
@@ -256,7 +267,6 @@ impl GuiState {
             Some(corplink_ipc::RespData::Status { status }) => self.set_status(status),
             Some(corplink_ipc::RespData::Servers { servers }) => {
                 self.servers = servers;
-                self.servers_loading = false;
                 self.touch();
             }
             Some(corplink_ipc::RespData::Logs { lines }) => {
@@ -288,9 +298,11 @@ impl GuiState {
     }
 
     pub fn request_servers(&mut self) -> ToDaemon {
+        let id = next_id();
         self.servers_loading = true;
+        self.servers_request_id = Some(id);
         self.touch();
-        ToDaemon::Servers { id: next_id() }
+        ToDaemon::Servers { id }
     }
 
     pub fn connect(&mut self, server: Option<String>) -> ToDaemon {
@@ -724,6 +736,42 @@ mod tests {
             .clear();
         assert_eq!(state.servers.len(), 1);
         assert!(!state.servers_loading);
+    }
+
+    #[test]
+    fn failed_server_replies_clear_loading() {
+        let mut state = GuiState::default();
+        let id = match state.request_servers() {
+            ToDaemon::Servers { id } => id,
+            other => panic!("{other:?}"),
+        };
+        state.apply(&FromDaemon::Reply {
+            id,
+            ok: false,
+            error: Some("probe timed out".into()),
+            data: None,
+        });
+        assert!(!state.servers_loading);
+        assert!(state
+            .logs
+            .back()
+            .is_some_and(|line| line.contains("probe timed out")));
+    }
+
+    #[test]
+    fn unrelated_failed_replies_do_not_clear_server_loading() {
+        let mut state = GuiState::default();
+        let server_id = match state.request_servers() {
+            ToDaemon::Servers { id } => id,
+            other => panic!("{other:?}"),
+        };
+        state.apply(&FromDaemon::Reply {
+            id: server_id + 1,
+            ok: false,
+            error: Some("another request failed".into()),
+            data: None,
+        });
+        assert!(state.servers_loading);
     }
 
     #[test]
