@@ -225,14 +225,24 @@ impl CorplinkApp {
             }
             (Some(LoginPrompt::EmailCode), true) => {
                 ui.label("输入邮箱收到的验证码：");
-                if let Some(value) = code_input_and_submit(ui, &mut self.state.code_input, "提交验证码") {
-                    self.send(ToDaemon::LoginReply { id: next_id(), value });
+                if let Some(value) =
+                    code_input_and_submit(ui, &mut self.state.code_input, "提交验证码")
+                {
+                    self.send(ToDaemon::LoginReply {
+                        id: next_id(),
+                        value,
+                    });
                 }
             }
             (Some(LoginPrompt::TwoFa), true) => {
                 ui.label("输入 6 位 2FA 验证码：");
-                if let Some(value) = code_input_and_submit(ui, &mut self.state.code_input, "提交验证码") {
-                    self.send(ToDaemon::LoginReply { id: next_id(), value });
+                if let Some(value) =
+                    code_input_and_submit(ui, &mut self.state.code_input, "提交验证码")
+                {
+                    self.send(ToDaemon::LoginReply {
+                        id: next_id(),
+                        value,
+                    });
                 }
             }
             (None, true) => {
@@ -296,7 +306,9 @@ impl eframe::App for CorplinkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events();
         self.pump_menu(ctx);
-        if self.panel.poll(&mut self.state, self.bundle.as_ref(), &self.outbound)
+        if self
+            .panel
+            .poll(&mut self.state, self.bundle.as_ref(), &self.outbound)
             || (self.state.link == Link::Disconnected
                 && self.last_service_check.elapsed() >= SERVICE_CHECK_INTERVAL)
         {
@@ -382,8 +394,7 @@ fn code_input_and_submit(ui: &mut egui::Ui, input: &mut String, button: &str) ->
             .hint_text("验证码")
             .desired_width(140.0);
         let response = ui.add(edit);
-        let enter = response.lost_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if (ui.button(button).clicked() || enter) && !input.trim().is_empty() {
             submitted = Some(input.trim().to_string());
         }

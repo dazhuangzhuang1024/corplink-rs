@@ -42,7 +42,10 @@ const SOCK_NAME: &str = "corplink-rs.sock";
 pub fn socket_candidates() -> Vec<PathBuf> {
     match env::var_os("CORPLINK_IPC_SOCK") {
         Some(path) => vec![PathBuf::from(path)],
-        None => vec![Path::new("/var/run").join(SOCK_NAME), env::temp_dir().join(SOCK_NAME)],
+        None => vec![
+            Path::new("/var/run").join(SOCK_NAME),
+            env::temp_dir().join(SOCK_NAME),
+        ],
     }
 }
 
@@ -257,11 +260,20 @@ mod tests {
         let msgs = vec![
             ToDaemon::Status { id: 1 },
             ToDaemon::Servers { id: 2 },
-            ToDaemon::Connect { id: 3, server: None },
-            ToDaemon::Connect { id: 4, server: Some("Node03".into()) },
+            ToDaemon::Connect {
+                id: 3,
+                server: None,
+            },
+            ToDaemon::Connect {
+                id: 4,
+                server: Some("Node03".into()),
+            },
             ToDaemon::Disconnect { id: 5 },
             ToDaemon::LoginStart { id: 6 },
-            ToDaemon::LoginReply { id: 7, value: "123456".into() },
+            ToDaemon::LoginReply {
+                id: 7,
+                value: "123456".into(),
+            },
             ToDaemon::LoginCancel { id: 8 },
             ToDaemon::Logs { id: 9, tail: 200 },
             ToDaemon::Restart { id: 10 },
@@ -271,11 +283,21 @@ mod tests {
             assert!(line.ends_with('\n'));
             assert_eq!(&decode::<ToDaemon>(&line).unwrap(), msg);
         }
-        assert!(decode::<ToDaemon>(&encode(&ToDaemon::Connect { id: 3, server: None }))
-            .unwrap()
-            .eq(&ToDaemon::Connect { id: 3, server: None }));
+        assert!(decode::<ToDaemon>(&encode(&ToDaemon::Connect {
+            id: 3,
+            server: None
+        }))
+        .unwrap()
+        .eq(&ToDaemon::Connect {
+            id: 3,
+            server: None
+        }));
         // the wire form of a server-less connect carries no server field
-        assert!(!encode(&ToDaemon::Connect { id: 3, server: None }).contains("server"));
+        assert!(!encode(&ToDaemon::Connect {
+            id: 3,
+            server: None
+        })
+        .contains("server"));
     }
 
     #[test]
@@ -296,7 +318,9 @@ mod tests {
                 id: 1,
                 ok: true,
                 error: None,
-                data: Some(RespData::Status { status: status.clone() }),
+                data: Some(RespData::Status {
+                    status: status.clone(),
+                }),
             },
             FromDaemon::Reply {
                 id: 2,
@@ -321,13 +345,27 @@ mod tests {
                 id: 4,
                 ok: true,
                 error: None,
-                data: Some(RespData::Logs { lines: vec!["one".into(), "two".into()] }),
+                data: Some(RespData::Logs {
+                    lines: vec!["one".into(), "two".into()],
+                }),
             },
-            FromDaemon::StatusChanged { status: status.clone() },
-            FromDaemon::LogLine { line: "[info] hi".into() },
-            FromDaemon::LoginPromptUpdate { prompt: Some(LoginPrompt::Qr { url: "https://x".into() }) },
-            FromDaemon::LoginPromptUpdate { prompt: Some(LoginPrompt::EmailCode) },
-            FromDaemon::LoginPromptUpdate { prompt: Some(LoginPrompt::TwoFa) },
+            FromDaemon::StatusChanged {
+                status: status.clone(),
+            },
+            FromDaemon::LogLine {
+                line: "[info] hi".into(),
+            },
+            FromDaemon::LoginPromptUpdate {
+                prompt: Some(LoginPrompt::Qr {
+                    url: "https://x".into(),
+                }),
+            },
+            FromDaemon::LoginPromptUpdate {
+                prompt: Some(LoginPrompt::EmailCode),
+            },
+            FromDaemon::LoginPromptUpdate {
+                prompt: Some(LoginPrompt::TwoFa),
+            },
             FromDaemon::LoginPromptUpdate { prompt: None },
         ];
         for msg in &msgs {

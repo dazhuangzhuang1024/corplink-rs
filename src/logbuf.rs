@@ -82,14 +82,20 @@ impl log::Log for ForwardingLogger {
 /// `[2026-10-07T16:45:52Z INFO  corplink_rs::dns] split dns: removed ...`
 fn format_line(record: &log::Record) -> String {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    format!("[{} {:<5} {}] {}", ts, record.level(), record.target(), record.args())
+    format!(
+        "[{} {:<5} {}] {}",
+        ts,
+        record.level(),
+        record.target(),
+        record.args()
+    )
 }
 
 /// Installs the wrapper around the env_logger built from the environment.
 /// Returns the buffer the IPC server serves `logs` requests from.
 pub fn init() -> Result<Arc<LogBuffer>> {
-    let inner = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .build();
+    let inner =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
     // the ceiling env_logger itself would set: disabled levels stay a cheap
     // static check at every log call site, in every crate
     let max_level = inner.filter();

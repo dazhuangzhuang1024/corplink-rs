@@ -48,10 +48,7 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(move |cc| {
             Ok(Box::new(app::CorplinkApp::new(
-                cc,
-                event_rx,
-                menu_rx,
-                outbound,
+                cc, event_rx, menu_rx, outbound,
             )))
         }),
     )

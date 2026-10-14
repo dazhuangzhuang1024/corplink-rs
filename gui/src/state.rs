@@ -219,7 +219,12 @@ impl GuiState {
                 }
                 self.touch();
             }
-            FromDaemon::Reply { id, ok, error, data } => {
+            FromDaemon::Reply {
+                id,
+                ok,
+                error,
+                data,
+            } => {
                 self.apply_reply(*id, *ok, error.clone(), data.clone());
             }
         }
@@ -306,7 +311,10 @@ impl GuiState {
     }
 
     pub fn connect(&mut self, server: Option<String>) -> ToDaemon {
-        ToDaemon::Connect { id: next_id(), server }
+        ToDaemon::Connect {
+            id: next_id(),
+            server,
+        }
     }
 
     pub fn login_start(&mut self) -> ToDaemon {
@@ -371,7 +379,10 @@ impl GuiState {
                 RunState::Idle => "未连接".to_string(),
                 RunState::Connecting => "连接中…".to_string(),
                 RunState::Online => {
-                    let mut line = format!("已连接 · {}", self.status.server.clone().unwrap_or_default());
+                    let mut line = format!(
+                        "已连接 · {}",
+                        self.status.server.clone().unwrap_or_default()
+                    );
                     if let Some(since) = self.status.since_unix {
                         let up = chrono_like_elapsed(since);
                         if !up.is_empty() {
@@ -571,7 +582,10 @@ mod tests {
 
         // the daemon waits for a login: the menu item starts it
         state.status.state = RunState::LoginNeeded;
-        assert!(matches!(state.open_login(), Some(ToDaemon::LoginStart { .. })));
+        assert!(matches!(
+            state.open_login(),
+            Some(ToDaemon::LoginStart { .. })
+        ));
         // but not a second one over a standing prompt
         state.prompt = Some(LoginPrompt::EmailCode);
         assert!(state.open_login().is_none());
@@ -695,18 +709,16 @@ mod tests {
         state.apply(&FromDaemon::LoginPromptUpdate {
             prompt: Some(LoginPrompt::Qr { url: url.clone() }),
         });
-        assert_eq!(
-            state.prompt,
-            Some(LoginPrompt::Qr {
-                url: url.clone(),
-            })
-        );
+        assert_eq!(state.prompt, Some(LoginPrompt::Qr { url: url.clone() }));
         assert!(state.show_login);
 
         state.code_input = "123456".into();
         state.apply(&FromDaemon::LoginPromptUpdate { prompt: None });
         assert!(state.prompt.is_none());
-        assert!(state.code_input.is_empty(), "stale input must not leak into the next prompt");
+        assert!(
+            state.code_input.is_empty(),
+            "stale input must not leak into the next prompt"
+        );
     }
 
     #[test]
@@ -799,7 +811,10 @@ mod tests {
         }
         assert_eq!(state.logs.len(), MAX_LOG_LINES);
         assert_eq!(state.logs.front().unwrap(), "line 100");
-        assert_eq!(state.logs.back().unwrap(), &format!("line {}", MAX_LOG_LINES + 99));
+        assert_eq!(
+            state.logs.back().unwrap(),
+            &format!("line {}", MAX_LOG_LINES + 99)
+        );
     }
 
     #[test]

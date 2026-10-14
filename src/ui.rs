@@ -41,11 +41,7 @@ impl std::fmt::Display for PromptError {
                  (e.g. running as a service); log in from corplink-gui, or stop the service \
                  and run corplink-rs once in a terminal"
             ),
-            PromptError::TimedOut => write!(
-                f,
-                "no answer within {}s",
-                PROMPT_TIMEOUT.as_secs()
-            ),
+            PromptError::TimedOut => write!(f, "no answer within {}s", PROMPT_TIMEOUT.as_secs()),
         }
     }
 }
@@ -272,7 +268,9 @@ impl LoginUi {
                 Ok(())
             }
             UiMode::Ipc(bridge) => bridge
-                .prompt(LoginPrompt::Qr { url: url.to_string() })
+                .prompt(LoginPrompt::Qr {
+                    url: url.to_string(),
+                })
                 .await
                 .map(|_| ())
                 // context, not format: the PromptError must stay in the chain
@@ -398,7 +396,10 @@ mod tests {
         // the new prompt published and answerable
         old.abort();
         let _ = old.await;
-        assert_eq!(*bridge.subscribe_prompts().borrow(), Some(LoginPrompt::TwoFa));
+        assert_eq!(
+            *bridge.subscribe_prompts().borrow(),
+            Some(LoginPrompt::TwoFa)
+        );
         assert!(bridge.reply("654321".to_string()));
         assert_eq!(new_task.await.unwrap().unwrap(), "654321");
     }
@@ -407,8 +408,7 @@ mod tests {
     async fn a_new_prompt_steals_the_slot_from_the_old_one() {
         let bridge = bridge_with_gui();
         let b = bridge.clone();
-        let old =
-            tokio::spawn(async move { b.prompt(LoginPrompt::EmailCode).await });
+        let old = tokio::spawn(async move { b.prompt(LoginPrompt::EmailCode).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let new_task = tokio::spawn({
@@ -448,9 +448,7 @@ mod tests {
     async fn wait_for_gui_sees_attaches_within_the_window() {
         // nothing attached: times out
         let none = LoginBridge::new();
-        assert!(
-            !none.wait_for_gui(Duration::from_millis(50)).await
-        );
+        assert!(!none.wait_for_gui(Duration::from_millis(50)).await);
 
         // attached before the wait: returns at once
         let early = Arc::new(LoginBridge::new());
@@ -491,7 +489,10 @@ mod tests {
             async move { ui.read_code(LoginPrompt::TwoFa).await }
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(*bridge.subscribe_prompts().borrow(), Some(LoginPrompt::TwoFa));
+        assert_eq!(
+            *bridge.subscribe_prompts().borrow(),
+            Some(LoginPrompt::TwoFa)
+        );
         assert!(bridge.reply("123456".to_string()));
         assert_eq!(prompt.await.unwrap().unwrap(), "123456");
     }

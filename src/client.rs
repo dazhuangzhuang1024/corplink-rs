@@ -119,10 +119,7 @@ fn merge_additional_routes(
     routes
 }
 
-async fn resolve_additional_domains(
-    domains: &[String],
-    has_ipv6_address: bool,
-) -> Vec<String> {
+async fn resolve_additional_domains(domains: &[String], has_ipv6_address: bool) -> Vec<String> {
     let mut routes = Vec::new();
     for configured_domain in domains {
         let domain = configured_domain.trim();
@@ -603,9 +600,7 @@ impl Client {
         // or, for the daemon, from the GUI over IPC
         self.ui.qr_confirm(url).await?;
         match method {
-            PLATFORM_LARK | PLATFORM_OIDC => {
-                self.check_tps_token(token).await
-            }
+            PLATFORM_LARK | PLATFORM_OIDC => self.check_tps_token(token).await,
             _ => {
                 // TODO: add all tps login support
                 bail!("unsupported platform, please contact the developer")
@@ -1352,7 +1347,11 @@ impl Client {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
             Err(_) => format!("{}:{}", vpn.ip, vpn.vpn_port),
         };
-        log::info!("try connect to {}, address {}", vpn.display_name(), vpn_addr);
+        log::info!(
+            "try connect to {}, address {}",
+            vpn.display_name(),
+            vpn_addr
+        );
 
         let key = self
             .conf
@@ -1452,22 +1451,14 @@ impl Client {
             }
         };
 
-        let mut additional_routes = self
-            .conf
-            .vpn_additional_routes
-            .clone()
-            .unwrap_or_default();
+        let mut additional_routes = self.conf.vpn_additional_routes.clone().unwrap_or_default();
         if let Some(domains) = self.conf.vpn_additional_domains.as_deref() {
-            additional_routes
-                .extend(resolve_additional_domains(domains, has_ipv6_address).await);
+            additional_routes.extend(resolve_additional_domains(domains, has_ipv6_address).await);
         }
         if !additional_routes.is_empty() {
             let before = allowed_ips.len();
-            allowed_ips = merge_additional_routes(
-                allowed_ips,
-                &additional_routes,
-                has_ipv6_address,
-            );
+            allowed_ips =
+                merge_additional_routes(allowed_ips, &additional_routes, has_ipv6_address);
             log::info!(
                 "additional VPN routes merged: {} -> {} entries",
                 before,
@@ -2228,7 +2219,10 @@ mod tests {
             "/api/tpslogin/link",
             r#"{"code":0,"data":[{"alias":"lark","login_url":"https://auth.example/qr","token":"t"}]}"#,
         ),
-        ("/api/lookup", r#"{"code":0,"data":{"mfa":false,"auth":["email"]}}"#),
+        (
+            "/api/lookup",
+            r#"{"code":0,"data":{"mfa":false,"auth":["email"]}}"#,
+        ),
         ("/api/login/code/send", r#"{"code":0,"data":{}}"#),
     ];
 
@@ -2239,7 +2233,10 @@ mod tests {
             r#"{"code":0,"data":{"login_enable_ldap":false,"login_enable":true,"login_orders":["feilian"]}}"#,
         ),
         ("/api/tpslogin/link", r#"{"code":0,"data":[]}"#),
-        ("/api/lookup", r#"{"code":0,"data":{"mfa":false,"auth":["email"]}}"#),
+        (
+            "/api/lookup",
+            r#"{"code":0,"data":{"mfa":false,"auth":["email"]}}"#,
+        ),
         ("/api/login/code/send", r#"{"code":0,"data":{}}"#),
     ];
 

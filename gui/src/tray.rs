@@ -2,7 +2,9 @@
 
 use crate::state::{GuiState, IconKind, Link};
 use corplink_ipc::RunState;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// Tray menu item ids the event handler reacts to.
@@ -314,7 +316,11 @@ fn service_menu(state: &GuiState) -> Submenu {
 
 /// The items every menu ends with.
 fn append_tail(menu: &Menu, state: &GuiState) {
-    let logs_label = if state.show_logs { "隐藏日志" } else { "日志…" };
+    let logs_label = if state.show_logs {
+        "隐藏日志"
+    } else {
+        "日志…"
+    };
     let _ = menu.append(&item(ids::LOGS, logs_label, true));
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&item(ids::QUIT, "退出 GUI（VPN 不受影响）", true));
@@ -344,7 +350,10 @@ mod tests {
         ] {
             let (rgba, w, h) = icon_rgba(kind);
             assert_eq!(rgba.len(), (w * h * 4) as usize);
-            assert!(rgba.chunks(4).any(|px| px[3] > 0), "{kind:?} fully transparent");
+            assert!(
+                rgba.chunks(4).any(|px| px[3] > 0),
+                "{kind:?} fully transparent"
+            );
         }
         // the states must be distinguishable
         let (online, _, _) = icon_rgba(IconKind::Online);

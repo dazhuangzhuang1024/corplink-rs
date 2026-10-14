@@ -453,8 +453,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("corplink-ipc-test-{unique}-{seq}.sock"));
+            let path = std::env::temp_dir().join(format!("corplink-ipc-test-{unique}-{seq}.sock"));
             let logs = Arc::new(LogBuffer::new());
             let bridge = Arc::new(LoginBridge::new());
             let (status_tx, _) = watch::channel(Status {
@@ -546,10 +545,7 @@ mod tests {
 
     /// Consumes the two initial frames every fresh connection receives.
     async fn drain_initial_frames(gui: &mut Gui) {
-        assert!(matches!(
-            gui.recv().await,
-            FromDaemon::StatusChanged { .. }
-        ));
+        assert!(matches!(gui.recv().await, FromDaemon::StatusChanged { .. }));
         assert!(matches!(
             gui.recv().await,
             FromDaemon::LoginPromptUpdate { .. }
@@ -558,8 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_gui_gets_status_and_can_query_it() {
-        let (daemon, mut gui) =
-            connect_accepted(unsafe { libc::getuid() }).await;
+        let (daemon, mut gui) = connect_accepted(unsafe { libc::getuid() }).await;
 
         // the initial events arrive without asking
         match gui.recv().await {
@@ -576,7 +571,11 @@ mod tests {
 
         gui.send(&ToDaemon::Status { id: 7 }).await;
         match gui.recv_reply(7).await {
-            FromDaemon::Reply { ok: true, data: Some(RespData::Status { status }), .. } => {
+            FromDaemon::Reply {
+                ok: true,
+                data: Some(RespData::Status { status }),
+                ..
+            } => {
                 assert_eq!(status.state, RunState::Idle);
             }
             other => panic!("expected a status reply, got {other:?}"),
@@ -599,8 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_return_the_tail_then_stream_live_lines() {
-        let (daemon, mut gui) =
-            connect_accepted(unsafe { libc::getuid() }).await;
+        let (daemon, mut gui) = connect_accepted(unsafe { libc::getuid() }).await;
         daemon.logs.push("[info] old one".to_string());
         daemon.logs.push("[info] old two".to_string());
 
@@ -669,7 +667,9 @@ mod tests {
         })
         .await;
         match gui.recv_reply(2).await {
-            FromDaemon::Reply { ok: false, error, .. } => {
+            FromDaemon::Reply {
+                ok: false, error, ..
+            } => {
                 assert!(error.unwrap().contains("no login prompt"))
             }
             other => panic!("expected an error reply, got {other:?}"),
@@ -678,8 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_commands_reach_the_supervisor_and_answers_flow_back() {
-        let (mut daemon, mut gui) =
-            connect_accepted(unsafe { libc::getuid() }).await;
+        let (mut daemon, mut gui) = connect_accepted(unsafe { libc::getuid() }).await;
 
         gui.send(&ToDaemon::Connect {
             id: 10,
@@ -706,7 +705,9 @@ mod tests {
             other => panic!("expected a disconnect command, got {other:?}"),
         }
         match gui.recv_reply(11).await {
-            FromDaemon::Reply { ok: false, error, .. } => {
+            FromDaemon::Reply {
+                ok: false, error, ..
+            } => {
                 assert_eq!(error.unwrap(), "already idle")
             }
             other => panic!("expected an error reply, got {other:?}"),
@@ -743,7 +744,9 @@ mod tests {
             other => panic!("expected a restart command, got {other:?}"),
         }
         match gui.recv_reply(13).await {
-            FromDaemon::Reply { ok: false, error, .. } => {
+            FromDaemon::Reply {
+                ok: false, error, ..
+            } => {
                 assert_eq!(error.unwrap(), "not started by launchd")
             }
             other => panic!("expected an error reply, got {other:?}"),

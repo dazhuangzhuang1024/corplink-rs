@@ -205,10 +205,12 @@ async fn run() -> Result<()> {
     #[cfg(unix)]
     let allowed_uid = {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(&conf_file).map(|m| m.uid()).unwrap_or_else(|_| {
-            // SAFETY: geteuid cannot fail
-            unsafe { libc::geteuid() }
-        })
+        std::fs::metadata(&conf_file)
+            .map(|m| m.uid())
+            .unwrap_or_else(|_| {
+                // SAFETY: geteuid cannot fail
+                unsafe { libc::geteuid() }
+            })
     };
     #[cfg(not(unix))]
     let allowed_uid = 0;
@@ -424,8 +426,14 @@ async fn supervise(
             status.server = Some(session.wg_conf.server_name.clone());
             status.since_unix = Some(session.since_unix);
             status.dns = Some(session.wg_conf.dns.clone());
-            status.protocol =
-                Some(if session.wg_conf.protocol == 1 { "tcp" } else { "udp" }.to_string());
+            status.protocol = Some(
+                if session.wg_conf.protocol == 1 {
+                    "tcp"
+                } else {
+                    "udp"
+                }
+                .to_string(),
+            );
             status.server_split_dns_domains = session.wg_conf.server_split_dns.clone();
         }
         shared.update_status(status);

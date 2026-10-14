@@ -274,7 +274,12 @@ fn invoking_user_home() -> Option<PathBuf> {
     // SAFETY: geteuid cannot fail
     let euid = unsafe { libc::geteuid() };
     let sudo_uid = std::env::var("SUDO_UID").ok();
-    choose_home(euid, sudo_uid.as_deref(), std::env::var_os("HOME"), home_of_uid)
+    choose_home(
+        euid,
+        sudo_uid.as_deref(),
+        std::env::var_os("HOME"),
+        home_of_uid,
+    )
 }
 
 #[cfg(not(unix))]
@@ -319,9 +324,7 @@ fn home_of_uid(uid: u32) -> Option<PathBuf> {
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: both buffers outlive the call, and their sizes are passed along
-    let rc = unsafe {
-        libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found)
-    };
+    let rc = unsafe { libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) };
     if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
         return None;
     }
@@ -405,8 +408,14 @@ mod tests {
             choose_home(501, None, home("/Users/someone"), passwd),
             Some(PathBuf::from("/Users/someone"))
         );
-        assert_eq!(choose_home(501, None, None, passwd), Some(PathBuf::from("/Users/someone")));
-        assert_eq!(choose_home(501, None, home(""), passwd), Some(PathBuf::from("/Users/someone")));
+        assert_eq!(
+            choose_home(501, None, None, passwd),
+            Some(PathBuf::from("/Users/someone"))
+        );
+        assert_eq!(
+            choose_home(501, None, home(""), passwd),
+            Some(PathBuf::from("/Users/someone"))
+        );
         // root through sudo: the caller's home, whatever sudo did to HOME
         assert_eq!(
             choose_home(0, Some("501"), home("/root"), passwd),
@@ -423,7 +432,10 @@ mod tests {
             choose_home(0, Some("x"), home("/var/root"), passwd),
             Some(PathBuf::from("/var/root"))
         );
-        assert_eq!(choose_home(0, None, None, passwd), Some(PathBuf::from("/var/root")));
+        assert_eq!(
+            choose_home(0, None, None, passwd),
+            Some(PathBuf::from("/var/root"))
+        );
     }
 
     #[cfg(unix)]
